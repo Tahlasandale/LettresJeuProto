@@ -1328,11 +1328,11 @@ function initVotePhase() {
         const activePlayers = getActivePlayers();
         
         activePlayers.forEach((player) => {
-            // Anonymiser et exclure la propre carte de chaque joueur
+            // Anonymiser et exclure la propre carte de chaque joueur (si plus de 2 joueurs actifs)
             const clientOpts = gameState.voteOptions.map(opt => ({
                 playerId: opt.playerId,
                 text: opt.text,
-                isOwn: opt.playerId === player.id
+                isOwn: activePlayers.length > 2 ? (opt.playerId === player.id) : false
             }));
             
             if (player.id !== 0) {
@@ -1525,7 +1525,7 @@ function setupLocalVoteUI() {
     }
     
     gameState.voteOptions.forEach((opt) => {
-        const isOwn = (opt.playerId === currentVoter.id);
+        const isOwn = activePlayers.length > 2 ? (opt.playerId === currentVoter.id) : false;
         
         const card = document.createElement('div');
         card.className = `vote-card ${isOwn ? 'disabled' : ''}`;
