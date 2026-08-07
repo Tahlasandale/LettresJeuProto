@@ -727,6 +727,7 @@ function setupOnlineHostSaisieUI(duration) {
     const inputLabel = document.getElementById('saisie-input-label');
     const inputField = document.getElementById('saisie-input');
     
+    inputField.disabled = false;
     inputField.value = "";
     document.getElementById('saisie-progress').style.width = "0%";
     
@@ -783,6 +784,7 @@ function setupClientSaisieUI(duration) {
     const inputLabel = document.getElementById('saisie-input-label');
     const inputField = document.getElementById('saisie-input');
     
+    inputField.disabled = false;
     inputField.value = "";
     document.getElementById('saisie-progress').style.width = "0%";
     
