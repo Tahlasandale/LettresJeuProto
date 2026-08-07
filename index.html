@@ -9,6 +9,7 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css">
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
 </head>
 <body>
     <div id="particles-js"></div> <!-- Arrière-plan dynamique optionnel -->
@@ -33,44 +34,135 @@
                 </div>
                 
                 <div class="glass-panel lobby-panel">
-                    <h2>Configuration de la partie</h2>
-                    
-                    <div class="setup-group">
-                        <label for="round-count">Nombre de manches (mots à créer) :</label>
-                        <div class="number-selector">
-                            <button type="button" class="btn-minus" onclick="adjustRounds(-1)">-</button>
-                            <input type="number" id="round-count" value="2" min="1" max="5" readonly>
-                            <button type="button" class="btn-plus" onclick="adjustRounds(1)">+</button>
-                        </div>
+                    <div class="lobby-tabs">
+                        <button type="button" class="tab-btn active" id="tab-btn-local" onclick="selectLobbyMode('LOCAL')">Local (Pass & Play)</button>
+                        <button type="button" class="tab-btn" id="tab-btn-online" onclick="selectLobbyMode('ONLINE')">En Ligne (Réseau)</button>
                     </div>
 
-                    <div class="setup-group">
-                        <label>Options du Chronomètre :</label>
-                        <div class="toggle-container">
-                            <label class="switch">
-                                <input type="checkbox" id="timer-toggle" checked onchange="toggleTimerSettings()">
-                                <span class="slider round"></span>
-                            </label>
-                            <span id="timer-status-text">Actif (Règles officielles)</span>
-                        </div>
-                    </div>
-
-                    <div class="setup-group">
-                        <label>Joueurs (2 à 4) :</label>
-                        <div id="players-list-input">
-                            <div class="player-input-row">
-                                <span class="player-num">J1</span>
-                                <input type="text" class="player-name-input" placeholder="Pseudo Joueur 1" value="Bison">
-                            </div>
-                            <div class="player-input-row">
-                                <span class="player-num">J2</span>
-                                <input type="text" class="player-name-input" placeholder="Pseudo Joueur 2" value="Alphonsine">
+                    <!-- SECTION 1A : SETUP LOCAL -->
+                    <div id="lobby-local-section" class="lobby-section">
+                        <h2>Configuration Locale (Pass & Play)</h2>
+                        
+                        <div class="setup-group">
+                            <label for="round-count">Nombre de manches (mots à créer) :</label>
+                            <div class="number-selector">
+                                <button type="button" class="btn-minus" onclick="adjustRounds(-1)">-</button>
+                                <input type="number" id="round-count" value="2" min="1" max="5" readonly>
+                                <button type="button" class="btn-plus" onclick="adjustRounds(1)">+</button>
                             </div>
                         </div>
-                        <button type="button" id="btn-add-player" class="btn btn-secondary btn-sm" onclick="addPlayerField()">+ Ajouter un joueur</button>
+
+                        <div class="setup-group">
+                            <label>Options du Chronomètre :</label>
+                            <div class="toggle-container">
+                                <label class="switch">
+                                    <input type="checkbox" id="timer-toggle" checked onchange="toggleTimerSettings()">
+                                    <span class="slider round"></span>
+                                </label>
+                                <span id="timer-status-text">Actif (30s / 90s)</span>
+                            </div>
+                        </div>
+
+                        <div class="setup-group">
+                            <label>Joueurs (2 à 4) :</label>
+                            <div id="players-list-input">
+                                <div class="player-input-row">
+                                    <span class="player-num">J1</span>
+                                    <input type="text" class="player-name-input" placeholder="Pseudo Joueur 1" value="Bison">
+                                </div>
+                                <div class="player-input-row">
+                                    <span class="player-num">J2</span>
+                                    <input type="text" class="player-name-input" placeholder="Pseudo Joueur 2" value="Alphonsine">
+                                </div>
+                            </div>
+                            <button type="button" id="btn-add-player" class="btn btn-secondary btn-sm" onclick="addPlayerField()">+ Ajouter un joueur</button>
+                        </div>
+
+                        <button type="button" class="btn btn-primary btn-large btn-glow" onclick="startGame()">Lancer la partie</button>
                     </div>
 
-                    <button type="button" class="btn btn-primary btn-large" onclick="startGame()">Lancer la partie</button>
+                    <!-- SECTION 1B : SETUP EN LIGNE -->
+                    <div id="lobby-online-section" class="lobby-section hidden">
+                        <div class="online-subtabs">
+                            <button type="button" class="subtab-btn active" id="subtab-btn-host" onclick="selectOnlineRole('HOST')">Créer une partie</button>
+                            <button type="button" class="subtab-btn" id="subtab-btn-client" onclick="selectOnlineRole('CLIENT')">Rejoindre une partie</button>
+                        </div>
+
+                        <!-- 1B.1 : Créeer une partie (Hôte) -->
+                        <div id="online-host-setup" class="online-setup-panel">
+                            <h2>Créer un salon</h2>
+                            <div class="setup-group">
+                                <label for="online-host-name">Pseudo de l'Hôte :</label>
+                                <div class="input-wrapper">
+                                    <input type="text" id="online-host-name" value="Bison" placeholder="Pseudo de l'Hôte...">
+                                    <label for="online-host-name">Mon Pseudo</label>
+                                </div>
+                            </div>
+
+                            <div class="setup-group">
+                                <label for="online-round-count">Nombre de manches :</label>
+                                <div class="number-selector">
+                                    <button type="button" class="btn-minus" onclick="adjustOnlineRounds(-1)">-</button>
+                                    <input type="number" id="online-round-count" value="2" min="1" max="5" readonly>
+                                    <button type="button" class="btn-plus" onclick="adjustOnlineRounds(1)">+</button>
+                                </div>
+                            </div>
+
+                            <div class="setup-group">
+                                <label>Options du Chronomètre :</label>
+                                <div class="toggle-container">
+                                    <label class="switch">
+                                        <input type="checkbox" id="online-timer-toggle" checked onchange="toggleOnlineTimerSettings()">
+                                        <span class="slider round"></span>
+                                    </label>
+                                    <span id="online-timer-status-text">Actif (30s / 90s)</span>
+                                </div>
+                            </div>
+
+                            <button type="button" class="btn btn-primary btn-large btn-glow" onclick="createOnlineGame()">Générer la partie</button>
+                        </div>
+
+                        <!-- 1B.2 : Rejoindre une partie (Client) -->
+                        <div id="online-client-setup" class="online-setup-panel hidden">
+                            <h2>Rejoindre un salon</h2>
+                            <div class="setup-group">
+                                <label for="online-client-name">Ton Pseudo :</label>
+                                <div class="input-wrapper">
+                                    <input type="text" id="online-client-name" value="Alphonsine" placeholder="Ton pseudo...">
+                                    <label for="online-client-name">Pseudo</label>
+                                </div>
+                            </div>
+                            <div class="setup-group">
+                                <label for="online-game-code">Code de la partie :</label>
+                                <div class="input-wrapper">
+                                    <input type="text" id="online-game-code" placeholder="Entrer le code (Ex: NEO-1234)..." style="text-transform: uppercase;">
+                                    <label for="online-game-code">Code Salon</label>
+                                </div>
+                            </div>
+                            <button type="button" class="btn btn-primary btn-large btn-glow" onclick="joinOnlineGame()">Rejoindre la partie</button>
+                        </div>
+
+                        <!-- 1B.3 : Salon en ligne actif (Une fois connecté/créé) -->
+                        <div id="online-lobby-room" class="online-setup-panel hidden text-center">
+                            <div class="code-box">
+                                <span class="code-label">CODE DU SALON :</span>
+                                <div id="lobby-room-code" class="glow-text">NEO-XXXX</div>
+                            </div>
+                            
+                            <div class="setup-group" style="margin-top: 24px;">
+                                <label>Joueurs connectés :</label>
+                                <div id="online-players-list-display" class="online-players-rack">
+                                    <!-- Liste des joueurs connectés -->
+                                </div>
+                            </div>
+                            
+                            <div id="online-lobby-status-msg" class="info-text">En attente de connexion...</div>
+                            
+                            <div class="online-lobby-actions" style="margin-top: 24px;">
+                                <button type="button" id="btn-start-online-game" class="btn btn-primary btn-large btn-glow" disabled onclick="startOnlineGame()">Lancer la partie</button>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </section>
 

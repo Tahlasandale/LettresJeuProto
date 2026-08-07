@@ -1,6 +1,6 @@
 /* ==========================================================================
    NÉOLOGIX - GAME ENGINE (app.js)
-   Vanilla JS - Logic, State Management, Timers & Animations
+   Vanilla JS - Logic, State Management, WebRTC (PeerJS) & Animations
    ========================================================================== */
 
 // --- Dictionnaire Scrabble (Points en Français) ---
@@ -14,11 +14,15 @@ const CONSONANTS = ['B', 'C', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 'M', 'N', 'P', 
 
 // --- État Global du Jeu ---
 let gameState = {
-    players: [],             // { id, name, score, active: true, initialIndex }
+    mode: 'LOCAL',           // 'LOCAL' | 'ONLINE'
+    isHost: false,           // Hôte de la partie réseau
+    myPlayerId: 0,           // Mon ID joueur local (0 pour l'Hôte / J1)
+    players: [],             // { id, name, score, active: true }
     roundCount: 2,           // Nombre de manches total
     currentRound: 1,         // Manche en cours (1 à roundCount)
     currentPhase: 1,         // Phase en cours (1 = Mot, 2 = Définition, 3 = Phrase)
     timerEnabled: true,      // Active/Désactive la limite de temps
+    gamePhase: 'LOBBY',      // 'LOBBY'|'INPUT'|'VOTE'|'REVEAL'|'CADAVRE'|'STORY_VOTE'|'PODIUM'
     
     // Données par manche
     roundData: {},           // { roundIndex: { letters: [], word: '', wordAuthor: id, definition: '', defAuthor: id, sentence: '', sentenceAuthor: id } }
@@ -27,21 +31,27 @@ let gameState = {
     propositions: [],        // { playerId, text }
     votes: [],               // { voterId, targetId }
     
-    // Index pour le Pass-and-play
-    activePlayerIndex: 0,    // Qui est en train d'écrire
-    activeVoterIndex: 0,     // Qui est en train de voter
+    // Index pour le Pass-and-play local
+    activePlayerIndex: 0,    // Qui est en train d'écrire en local
+    activeVoterIndex: 0,     // Qui est en train de voter en local
     
     // Mort Subite (Gestion des égalités)
     mortSubiteTies: null,    // Array de playerIds si égalité active
     isMortSubite: false,     // Flag de revote actif
-    mortSubiteCount: 0,      // Compteur de revotes pour éviter la boucle infinie
+    mortSubiteCount: 0,      // Compteur de revotes
     
     // Cadavre Exquis
-    cadavreSentences: [],    // { playerId, text }
+    cadavreSentences: [],    // { playerId, text, usedWord }
     cadavreVotes: [],        // { voterId, targetId }
-    activeCadavreIndex: 0,   // Joueur en train de rédiger
-    winningWordsList: [],    // Liste plate des mots gagnants à utiliser
+    activeCadavreIndex: 0,   // Joueur en train de rédiger (local ou réseau)
+    winningWordsList: [],    // Liste des mots gagnants à utiliser
 };
+
+// --- Variables Réseau & PeerJS ---
+let peer = null;
+let connections = new Map(); // Map de { playerId: DataConnection } (Hôte seulement)
+let myConnection = null;     // Liaison avec l'hôte (Client seulement)
+let onlineRole = 'HOST';     // 'HOST' | 'CLIENT'
 
 // --- Variables Système ---
 let timerInterval = null;
@@ -63,13 +73,52 @@ const screens = {
 
 // --- Initialisation ---
 document.addEventListener('DOMContentLoaded', () => {
-    toggleTimerSettings(); // Initialise l'état de l'affichage du timer
+    toggleTimerSettings(); // Initialise l'affichage du timer local
 });
 
-// --- Gestion de la Configuration (Lobby) ---
+// --- Gestion des Onglets du Lobby ---
+
+function selectLobbyMode(mode) {
+    gameState.mode = mode;
+    
+    // Mettre à jour les boutons d'onglets
+    document.getElementById('tab-btn-local').classList.toggle('active', mode === 'LOCAL');
+    document.getElementById('tab-btn-online').classList.toggle('active', mode === 'ONLINE');
+    
+    // Afficher la section correspondante
+    document.getElementById('lobby-local-section').classList.toggle('hidden', mode !== 'LOCAL');
+    document.getElementById('lobby-online-section').classList.toggle('hidden', mode !== 'ONLINE');
+    
+    // Reset les peers si on change
+    cleanupNetwork();
+}
+
+function selectOnlineRole(role) {
+    onlineRole = role;
+    
+    // Onglets de rôle en ligne
+    document.getElementById('subtab-btn-host').classList.toggle('active', role === 'HOST');
+    document.getElementById('subtab-btn-client').classList.toggle('active', role === 'CLIENT');
+    
+    // Formulaires
+    document.getElementById('online-host-setup').classList.toggle('hidden', role !== 'HOST');
+    document.getElementById('online-client-setup').classList.toggle('hidden', role !== 'CLIENT');
+    document.getElementById('online-lobby-room').classList.add('hidden'); // masquer le salon actif
+    
+    cleanupNetwork();
+}
 
 function adjustRounds(amount) {
     const roundInput = document.getElementById('round-count');
+    let val = parseInt(roundInput.value) + amount;
+    if (val >= 1 && val <= 5) {
+        roundInput.value = val;
+        gameState.roundCount = val;
+    }
+}
+
+function adjustOnlineRounds(amount) {
+    const roundInput = document.getElementById('online-round-count');
     let val = parseInt(roundInput.value) + amount;
     if (val >= 1 && val <= 5) {
         roundInput.value = val;
@@ -91,12 +140,28 @@ function toggleTimerSettings() {
     }
 }
 
+function toggleOnlineTimerSettings() {
+    const timerToggle = document.getElementById('online-timer-toggle');
+    const timerStatus = document.getElementById('online-timer-status-text');
+    gameState.timerEnabled = timerToggle.checked;
+    
+    if (gameState.timerEnabled) {
+        timerStatus.textContent = "Actif (30s / 90s)";
+        timerStatus.style.color = "var(--color-primary)";
+    } else {
+        timerStatus.textContent = "Désactivé (Pas de limite)";
+        timerStatus.style.color = "var(--text-muted)";
+    }
+}
+
+// --- Gestion des Joueurs (Local) ---
+
 function addPlayerField() {
     const container = document.getElementById('players-list-input');
     const currentCount = container.children.length;
     
     if (currentCount >= 4) {
-        alert("Maximum 4 joueurs pour ce prototype local.");
+        alert("Maximum 4 joueurs pour ce prototype.");
         return;
     }
     
@@ -109,7 +174,6 @@ function addPlayerField() {
     `;
     container.appendChild(row);
     
-    // Masquer le bouton d'ajout si on atteint le max
     if (container.children.length === 4) {
         document.getElementById('btn-add-player').style.display = 'none';
     }
@@ -120,20 +184,445 @@ function removePlayerField(button) {
     const container = document.getElementById('players-list-input');
     row.remove();
     
-    // Réindexer les numéros
     Array.from(container.children).forEach((child, index) => {
         child.querySelector('.player-num').textContent = `J${index + 1}`;
     });
     
-    // Réafficher le bouton d'ajout si en dessous du max
     if (container.children.length < 4) {
         document.getElementById('btn-add-player').style.display = 'inline-flex';
     }
 }
 
-// --- Lancement de la Partie ---
+// --- Nettoyage Réseau ---
+
+function cleanupNetwork() {
+    if (peer) {
+        peer.destroy();
+        peer = null;
+    }
+    connections.clear();
+    myConnection = null;
+    document.getElementById('btn-start-online-game').disabled = true;
+}
+
+// ==========================================================================
+// 🔌 COUCHE RÉSEAU (WebRTC avec PeerJS)
+// ==========================================================================
+
+function generatePeerId() {
+    // ID court et lisible (neo-xxxx)
+    return 'neo-' + Math.floor(1000 + Math.random() * 9000);
+}
+
+// --- HÔTE : Créer un salon ---
+
+function createOnlineGame() {
+    cleanupNetwork();
+    
+    const hostName = document.getElementById('online-host-name').value.trim();
+    if (hostName === "") {
+        alert("Veuillez saisir un pseudo.");
+        return;
+    }
+    
+    gameState.isHost = true;
+    gameState.myPlayerId = 0;
+    gameState.players = [{ id: 0, name: hostName, score: 0, active: true }];
+    
+    document.getElementById('online-lobby-status-msg').textContent = "Connexion au serveur PeerJS...";
+    
+    // Tenter de créer une connexion avec un ID court
+    const requestedId = generatePeerId();
+    peer = new Peer(requestedId);
+    
+    peer.on('open', (id) => {
+        setupHostLobbyUI(id);
+    });
+    
+    peer.on('connection', (conn) => {
+        handleIncomingConnection(conn);
+    });
+    
+    peer.on('error', (err) => {
+        console.error(err);
+        if (err.type === 'unavailable-id') {
+            // Collision d'ID, on réessaie avec un autre
+            createOnlineGame();
+        } else {
+            alert(`Erreur réseau : ${err.message}`);
+            cleanupNetwork();
+            selectLobbyMode('ONLINE');
+        }
+    });
+}
+
+function setupHostLobbyUI(id) {
+    document.getElementById('online-host-setup').classList.add('hidden');
+    document.getElementById('online-lobby-room').classList.remove('hidden');
+    document.getElementById('lobby-room-code').textContent = id.toUpperCase();
+    document.getElementById('online-lobby-status-msg').textContent = "En attente de joueurs (min. 2)...";
+    updateOnlinePlayersDisplay();
+}
+
+function handleIncomingConnection(conn) {
+    conn.on('open', () => {
+        // En attente du message JOIN du client
+        conn.on('data', (data) => {
+            if (data.type === 'JOIN') {
+                registerNewPlayer(conn, data.name);
+            } else {
+                handleHostIncomingMessage(data, conn.metadata.playerId);
+            }
+        });
+    });
+    
+    conn.on('close', () => {
+        if (conn.metadata && conn.metadata.playerId !== undefined) {
+            handlePlayerDisconnect(conn.metadata.playerId);
+        }
+    });
+}
+
+function registerNewPlayer(conn, name) {
+    if (gameState.players.length >= 4) {
+        conn.send({ type: 'KICK', reason: 'Le salon est complet (max 4 joueurs).' });
+        conn.close();
+        return;
+    }
+    
+    // Pseudo unique
+    let finalName = name.trim();
+    if (gameState.players.some(p => p.name.toLowerCase() === finalName.toLowerCase())) {
+        finalName += `_${gameState.players.length}`;
+    }
+    
+    const newId = gameState.players.length;
+    conn.metadata = { playerId: newId }; // Rattacher l'ID à la connexion
+    connections.set(newId, conn);
+    
+    gameState.players.push({
+        id: newId,
+        name: finalName,
+        score: 0,
+        active: true
+    });
+    
+    // Notifier le joueur connecté de ses infos
+    conn.send({
+        type: 'WELCOME',
+        playerId: newId,
+        players: gameState.players,
+        code: peer.id.toUpperCase(),
+        roundCount: gameState.roundCount,
+        timerEnabled: gameState.timerEnabled
+    });
+    
+    // Mettre à jour tout le monde
+    broadcastState();
+    updateOnlinePlayersDisplay();
+}
+
+function broadcastState() {
+    sendToAll({
+        type: 'LOBBY_UPDATE',
+        players: gameState.players
+    });
+}
+
+function sendToAll(data) {
+    connections.forEach((conn) => {
+        if (conn.open) {
+            conn.send(data);
+        }
+    });
+}
+
+function updateOnlinePlayersDisplay() {
+    const rack = document.getElementById('online-players-list-display');
+    rack.innerHTML = "";
+    
+    gameState.players.forEach((p) => {
+        const card = document.createElement('div');
+        card.className = `online-player-card ${p.id === 0 ? 'host-card' : 'client-card'}`;
+        card.textContent = p.name;
+        rack.appendChild(card);
+    });
+    
+    // Le bouton de lancement pour l'Hôte
+    const btnStart = document.getElementById('btn-start-online-game');
+    if (gameState.isHost) {
+        btnStart.style.display = 'inline-flex';
+        // Actif si >= 2 joueurs connectés (donc au moins 2 joueurs au total)
+        btnStart.disabled = gameState.players.length < 2;
+    } else {
+        btnStart.style.display = 'none';
+    }
+}
+
+// --- CLIENT : Rejoindre une partie ---
+
+function joinOnlineGame() {
+    cleanupNetwork();
+    
+    const clientName = document.getElementById('online-client-name').value.trim();
+    const rawCode = document.getElementById('online-game-code').value.trim();
+    
+    if (clientName === "" || rawCode === "") {
+        alert("Veuillez remplir votre pseudo et le code du salon.");
+        return;
+    }
+    
+    const hostId = rawCode.toLowerCase();
+    gameState.isHost = false;
+    
+    document.getElementById('online-lobby-status-msg').textContent = "Recherche du salon...";
+    document.getElementById('online-client-setup').classList.add('hidden');
+    document.getElementById('online-lobby-room').classList.remove('hidden');
+    document.getElementById('lobby-room-code').textContent = hostId.toUpperCase();
+    
+    peer = new Peer(); // ID aléatoire pour le client
+    
+    peer.on('open', () => {
+        myConnection = peer.connect(hostId);
+        
+        myConnection.on('open', () => {
+            document.getElementById('online-lobby-status-msg').textContent = "Connexion établie, enregistrement pseudo...";
+            myConnection.send({
+                type: 'JOIN',
+                name: clientName
+            });
+        });
+        
+        myConnection.on('data', (data) => {
+            handleClientIncomingMessage(data);
+        });
+        
+        myConnection.on('close', () => {
+            alert("⚠️ Liaison coupée avec l'Hôte. Retour au Lobby.");
+            resetGame();
+        });
+    });
+    
+    peer.on('error', (err) => {
+        console.error(err);
+        alert("Impossible de rejoindre ce salon. Vérifiez le code.");
+        resetGame();
+    });
+}
+
+// --- Traitement des messages entrant (HÔTE) ---
+
+function handleHostIncomingMessage(data, playerId) {
+    if (gameState.gamePhase === 'INPUT') {
+        if (data.type === 'SUBMIT_PROPOSITION') {
+            registerOnlineProposition(playerId, data.text);
+        }
+    } else if (gameState.gamePhase === 'VOTE') {
+        if (data.type === 'SUBMIT_VOTE') {
+            registerOnlineVote(playerId, data.targetId);
+        }
+    } else if (gameState.gamePhase === 'CADAVRE') {
+        if (data.type === 'SUBMIT_CADAVRE') {
+            registerOnlineCadavre(playerId, data.text, data.usedWord);
+        }
+    } else if (gameState.gamePhase === 'STORY_VOTE') {
+        if (data.type === 'SUBMIT_STORY_VOTE') {
+            registerOnlineStoryVote(playerId, data.targetId);
+        }
+    }
+}
+
+// --- Traitement des messages entrant (CLIENT) ---
+
+function handleClientIncomingMessage(data) {
+    switch (data.type) {
+        case 'WELCOME':
+            gameState.myPlayerId = data.playerId;
+            gameState.players = data.players;
+            gameState.roundCount = data.roundCount;
+            gameState.timerEnabled = data.timerEnabled;
+            document.getElementById('lobby-room-code').textContent = data.code;
+            document.getElementById('online-lobby-status-msg').textContent = "En attente du lancement par l'Hôte...";
+            updateOnlinePlayersDisplay();
+            break;
+            
+        case 'LOBBY_UPDATE':
+            gameState.players = data.players;
+            updateOnlinePlayersDisplay();
+            break;
+            
+        case 'KICK':
+            alert(`Exclu : ${data.reason}`);
+            resetGame();
+            break;
+            
+        case 'GAME_START':
+            // Lancement du jeu
+            document.getElementById('global-header').classList.remove('hidden');
+            showScreen('saisie'); // Sera configuré par PHASE_START immédiatement
+            break;
+            
+        case 'PHASE_START':
+            gameState.currentRound = data.round;
+            gameState.currentPhase = data.phase;
+            gameState.gamePhase = 'INPUT';
+            updateGlobalHeader();
+            
+            // Stocker temporairement pour affichage locale
+            gameState.roundData[data.round] = gameState.roundData[data.round] || {};
+            if (data.letters) gameState.roundData[data.round].letters = data.letters;
+            if (data.word) gameState.roundData[data.round].word = data.word;
+            if (data.definition) gameState.roundData[data.round].definition = data.definition;
+            
+            showScreen('saisie');
+            setupClientSaisieUI(data.duration);
+            break;
+            
+        case 'TIMER_TICK':
+            syncClientTimer(data.seconds, data.total);
+            break;
+            
+        case 'VOTE_START':
+            gameState.gamePhase = 'VOTE';
+            gameState.voteOptions = data.propositions;
+            gameState.isMortSubite = data.isMortSubite;
+            
+            showScreen('vote');
+            setupClientVoteUI();
+            break;
+            
+        case 'REVEAL_WINNER':
+            gameState.gamePhase = 'REVEAL';
+            if (stopConfettiFn) stopConfettiFn();
+            
+            // Mettre à jour les scores reçus
+            gameState.players = data.scoreboard;
+            
+            showScreen('reveal');
+            document.getElementById('reveal-winning-text').textContent = data.text;
+            document.getElementById('reveal-winner-author').textContent = data.authorName;
+            document.getElementById('reveal-points-added').textContent = data.points;
+            
+            renderScoreboard();
+            
+            // Désactiver le bouton continuer pour les clients (seul le Host continue)
+            const btnNext = document.querySelector('#screen-reveal .scoreboard-panel .btn-primary');
+            btnNext.style.display = 'none';
+            
+            stopConfettiFn = startConfetti('confetti-canvas');
+            break;
+            
+        case 'CADAVRE_START':
+            gameState.gamePhase = 'CADAVRE';
+            gameState.winningWordsList = data.winningWords;
+            document.getElementById('global-header').classList.add('hidden');
+            
+            showScreen('cadavreExquis');
+            setupClientCadavreUI(data.peekText, data.duration);
+            break;
+            
+        case 'CADAVRE_WAIT':
+            gameState.gamePhase = 'CADAVRE';
+            document.getElementById('global-header').classList.add('hidden');
+            showScreen('cadavreExquis');
+            setupClientCadavreWaitUI(data.writerName);
+            break;
+            
+        case 'STORY_REVEAL':
+            gameState.gamePhase = 'STORY_VOTE';
+            gameState.cadavreSentences = data.sentences;
+            gameState.cadavreVotes = [];
+            currentStoryVoterIdx = 0;
+            
+            showScreen('cadavreReveal');
+            renderOnlineStoryText(data.sentences, data.definitionsMap);
+            renderOnlineStoryVoteArea(data.activePlayers);
+            break;
+            
+        case 'STORY_VOTE_TICK':
+            // Rendre le vote pour le joueur actif en cours
+            updateOnlineStoryVoteStatus(data.currentVoterName, data.activePlayers);
+            break;
+            
+        case 'GAME_OVER':
+            gameState.gamePhase = 'PODIUM';
+            gameState.players = data.podium;
+            showScreen('podium');
+            showFinalPodium();
+            break;
+            
+        case 'PLAYER_DISCONNECT':
+            alert(`🔌 ${data.name} a quitté la partie.`);
+            gameState.players = data.players;
+            renderScoreboard();
+            break;
+    }
+}
+
+// --- Gestion des Déconnexions en cours de partie ---
+
+function handlePlayerDisconnect(playerId) {
+    const p = gameState.players.find(pl => pl.id === playerId);
+    if (!p) return;
+    
+    p.active = false;
+    connections.delete(playerId);
+    
+    // Diffuser la déconnexion
+    sendToAll({
+        type: 'PLAYER_DISCONNECT',
+        name: p.name,
+        players: gameState.players
+    });
+    
+    // Si la partie a commencé
+    if (gameState.gamePhase !== 'LOBBY') {
+        if (!checkActivePlayersCount()) return;
+        
+        // Vérifier si cela débloque une attente
+        if (gameState.gamePhase === 'INPUT') {
+            checkAllInputsSubmitted();
+        } else if (gameState.gamePhase === 'VOTE') {
+            checkAllVotesSubmitted();
+        } else if (gameState.gamePhase === 'CADAVRE') {
+            checkAllCadavreSubmitted();
+        } else if (gameState.gamePhase === 'STORY_VOTE') {
+            checkAllStoryVotesSubmitted();
+        }
+    } else {
+        updateOnlinePlayersDisplay();
+    }
+}
+
+
+// ==========================================================================
+// 🎮 LOGIQUE DE JEU PRINCIPALE
+// ==========================================================================
+
+function startOnlineGame() {
+    if (!gameState.isHost) return;
+    
+    gameState.mode = 'ONLINE';
+    
+    // Notifier tout le monde
+    sendToAll({ type: 'GAME_START' });
+    
+    // Masquer le lobby et lancer la manche 1
+    document.getElementById('global-header').classList.remove('hidden');
+    
+    gameState.currentRound = 1;
+    gameState.currentPhase = 1;
+    gameState.roundData = {};
+    gameState.winningWordsList = [];
+    
+    startNewRound();
+}
 
 function startGame() {
+    // Lancement LOCAL classique
+    gameState.mode = 'LOCAL';
+    gameState.isHost = false;
+    
     const nameInputs = document.querySelectorAll('.player-name-input');
     const players = [];
     
@@ -170,7 +659,7 @@ function startGame() {
     startNewRound();
 }
 
-// --- Lancement d'une Nouvelle Manche ---
+// --- Début de Manche ---
 
 function startNewRound() {
     const round = gameState.currentRound;
@@ -188,69 +677,294 @@ function startNewRound() {
         sentenceAuthor: null
     };
     
-    // Préparer la phase de saisie du Mot
     initSaisiePhase();
 }
 
-function generateLetters() {
-    let letters = [];
-    
-    // Minimum 2 voyelles obligatoires
-    const vowelCount = 2 + Math.floor(Math.random() * 2); // 2 ou 3 voyelles
-    for (let i = 0; i < vowelCount; i++) {
-        letters.push(VOWELS[Math.floor(Math.random() * VOWELS.length)]);
-    }
-    
-    // Compléter avec des consonnes
-    while (letters.length < 7) {
-        letters.push(CONSONANTS[Math.floor(Math.random() * CONSONANTS.length)]);
-    }
-    
-    // Mélanger le tirage
-    return letters.sort(() => Math.random() - 0.5);
-}
-
-// --- Phase de Saisie (Pass-and-play) ---
+// --- Phase de Saisie ---
 
 function initSaisiePhase() {
+    gameState.gamePhase = 'INPUT';
     gameState.propositions = [];
     gameState.activePlayerIndex = 0;
     
-    // S'assurer qu'au moins 2 joueurs sont actifs
     if (!checkActivePlayersCount()) return;
     
-    showTransitionScreenForInput();
+    if (gameState.mode === 'LOCAL') {
+        showTransitionScreenForInput();
+    } else {
+        // En ligne : tout le monde joue en même temps
+        const duration = (gameState.currentPhase === 1) ? 30 : 90;
+        const round = gameState.currentRound;
+        const phase = gameState.currentPhase;
+        
+        // Diffuser aux clients
+        sendToAll({
+            type: 'PHASE_START',
+            round: round,
+            phase: phase,
+            duration: duration,
+            letters: phase === 1 ? gameState.roundData[round].letters : null,
+            word: phase > 1 ? gameState.roundData[round].word : null,
+            definition: phase > 2 ? gameState.roundData[round].definition : null
+        });
+        
+        // Configurer l'hôte localement
+        showScreen('saisie');
+        setupOnlineHostSaisieUI(duration);
+    }
 }
 
-function checkActivePlayersCount() {
-    const activeCount = gameState.players.filter(p => p.active).length;
-    if (activeCount < 2) {
+// --- Configuration des UIs de Saisie Réseau ---
+
+function setupOnlineHostSaisieUI(duration) {
+    const round = gameState.currentRound;
+    const phase = gameState.currentPhase;
+    
+    // Similaire à la saisie locale mais pas d'index de joueur
+    const promptTitle = document.getElementById('saisie-prompt-title');
+    const contextArea = document.getElementById('saisie-context-area');
+    const helperText = document.getElementById('saisie-helper-text');
+    const inputLabel = document.getElementById('saisie-input-label');
+    const inputField = document.getElementById('saisie-input');
+    
+    inputField.value = "";
+    document.getElementById('saisie-progress').style.width = "0%";
+    
+    if (phase === 1) {
+        promptTitle.textContent = "Invente ton mot !";
+        inputLabel.textContent = "Néologisme";
+        inputField.placeholder = "Tape ton mot inventé...";
+        helperText.textContent = "Utilise les lettres ci-dessus.";
+        
+        const letters = gameState.roundData[round].letters;
+        let html = '<div class="letters-rack">';
+        letters.forEach((l, idx) => {
+            const pts = SCRABBLE_POINTS[l] || 1;
+            html += `<div class="letter-block" style="animation-delay: ${idx * 0.08}s">${l}<span class="letter-score">${pts}</span></div>`;
+        });
+        html += '</div>';
+        contextArea.innerHTML = html;
+    } else if (phase === 2) {
+        const officialWord = gameState.roundData[round].word;
+        promptTitle.textContent = "Trouve une définition !";
+        inputLabel.textContent = "Définition";
+        inputField.placeholder = "Selon toi, que veut dire ce mot...";
+        helperText.textContent = `Donne un sens au mot officiel : "${officialWord}"`;
+        contextArea.innerHTML = `<div class="word-pill">${officialWord}</div>`;
+    } else if (phase === 3) {
+        const officialWord = gameState.roundData[round].word;
+        const officialDef = gameState.roundData[round].definition;
+        promptTitle.textContent = "Fais une phrase !";
+        inputLabel.textContent = "Exemple de phrase";
+        inputField.placeholder = "Tape ta phrase d'exemple...";
+        helperText.textContent = `Utilise obligatoirement le mot "${officialWord}" dans ta phrase.`;
+        contextArea.innerHTML = `
+            <div class="word-pill">${officialWord}</div>
+            <p style="margin-top: 10px; font-style: italic; color: var(--text-main);">"${officialDef}"</p>
+        `;
+    }
+    
+    document.getElementById('btn-submit-saisie').disabled = false;
+    document.getElementById('btn-submit-saisie').onclick = submitOnlineHostSaisie;
+    
+    setTimeout(() => inputField.focus(), 100);
+    
+    // Chronomètre unique géré par l'Hôte
+    startOnlineTimer(duration);
+}
+
+function setupClientSaisieUI(duration) {
+    const round = gameState.currentRound;
+    const phase = gameState.currentPhase;
+    
+    const promptTitle = document.getElementById('saisie-prompt-title');
+    const contextArea = document.getElementById('saisie-context-area');
+    const helperText = document.getElementById('saisie-helper-text');
+    const inputLabel = document.getElementById('saisie-input-label');
+    const inputField = document.getElementById('saisie-input');
+    
+    inputField.value = "";
+    document.getElementById('saisie-progress').style.width = "0%";
+    
+    if (phase === 1) {
+        promptTitle.textContent = "Invente ton mot !";
+        inputLabel.textContent = "Néologisme";
+        inputField.placeholder = "Tape ton mot...";
+        helperText.textContent = "Utilise les lettres ci-dessus.";
+        
+        const letters = gameState.roundData[round].letters;
+        let html = '<div class="letters-rack">';
+        letters.forEach((l, idx) => {
+            const pts = SCRABBLE_POINTS[l] || 1;
+            html += `<div class="letter-block" style="animation-delay: ${idx * 0.08}s">${l}<span class="letter-score">${pts}</span></div>`;
+        });
+        html += '</div>';
+        contextArea.innerHTML = html;
+    } else if (phase === 2) {
+        const officialWord = gameState.roundData[round].word;
+        promptTitle.textContent = "Trouve une définition !";
+        inputLabel.textContent = "Définition";
+        inputField.placeholder = "Que veut dire ce mot...";
+        helperText.textContent = `Donne un sens au mot officiel : "${officialWord}"`;
+        contextArea.innerHTML = `<div class="word-pill">${officialWord}</div>`;
+    } else if (phase === 3) {
+        const officialWord = gameState.roundData[round].word;
+        const officialDef = gameState.roundData[round].definition;
+        promptTitle.textContent = "Fais une phrase !";
+        inputLabel.textContent = "Exemple de phrase";
+        inputField.placeholder = "Tape ta phrase d'exemple...";
+        helperText.textContent = `Utilise obligatoirement le mot "${officialWord}" dans ta phrase.`;
+        contextArea.innerHTML = `
+            <div class="word-pill">${officialWord}</div>
+            <p style="margin-top: 10px; font-style: italic; color: var(--text-main);">"${officialDef}"</p>
+        `;
+    }
+    
+    document.getElementById('btn-submit-saisie').disabled = false;
+    document.getElementById('btn-submit-saisie').onclick = submitClientSaisie;
+    
+    // Le client démarre un timer fictif qui sera synchronisé par l'Hôte
+    startClientTimer(duration);
+    
+    setTimeout(() => inputField.focus(), 100);
+}
+
+// --- Soumissions en Ligne ---
+
+function submitOnlineHostSaisie() {
+    const inputField = document.getElementById('saisie-input');
+    const val = inputField.value.trim();
+    
+    if (!validateSaisieInputLocal(val)) return;
+    
+    // Enregistrer localement
+    gameState.propositions.push({
+        playerId: 0, // Hôte
+        text: val
+    });
+    
+    // Désactiver le champ
+    inputField.disabled = true;
+    document.getElementById('btn-submit-saisie').disabled = true;
+    document.getElementById('saisie-prompt-title').textContent = "Proposition validée !";
+    document.getElementById('saisie-helper-text').textContent = "En attente des autres joueurs...";
+    
+    // Vérifier si tout le monde a répondu
+    checkAllInputsSubmitted();
+}
+
+function submitClientSaisie() {
+    const inputField = document.getElementById('saisie-input');
+    const val = inputField.value.trim();
+    
+    if (val === "") {
+        alert("Saisie vide !");
+        return;
+    }
+    
+    if (gameState.currentPhase === 1) {
+        if (!/^[a-zA-ZáàâäéèêëíìîïóòôöúùûüçÇœŒæÆ-]+$/.test(val) || val.length < 2) {
+            alert("Lettres et tiret uniquement (min. 2).");
+            return;
+        }
+    } else if (gameState.currentPhase === 3) {
+        const officialWord = gameState.roundData[gameState.currentRound].word.toLowerCase();
+        if (!val.toLowerCase().includes(officialWord)) {
+            alert(`Ta phrase doit contenir le mot "${gameState.roundData[gameState.currentRound].word}" !`);
+            return;
+        }
+    }
+    
+    // Envoyer à l'hôte
+    myConnection.send({
+        type: 'SUBMIT_PROPOSITION',
+        text: val
+    });
+    
+    inputField.disabled = true;
+    document.getElementById('btn-submit-saisie').disabled = true;
+    document.getElementById('saisie-prompt-title').textContent = "Proposition envoyée !";
+    document.getElementById('saisie-helper-text').textContent = "En attente de l'Hôte...";
+}
+
+function registerOnlineProposition(playerId, text) {
+    // Vérifier que le joueur n'a pas déjà soumis
+    if (gameState.propositions.some(p => p.playerId === playerId)) return;
+    
+    gameState.propositions.push({
+        playerId: playerId,
+        text: text
+    });
+    
+    checkAllInputsSubmitted();
+}
+
+function checkAllInputsSubmitted() {
+    const activeCount = getActivePlayers().length;
+    if (gameState.propositions.length >= activeCount) {
         clearInterval(timerInterval);
-        alert("🚨 Pas assez de joueurs actifs pour continuer la partie ! Tout le monde a été maudit ?");
-        endGameDirectly();
+        initVotePhase();
+    }
+}
+
+function validateSaisieInputLocal(val) {
+    if (val === "") {
+        alert("Tu ne peux pas valider une proposition vide !");
         return false;
     }
+    
+    if (gameState.currentPhase === 1) {
+        if (!/^[a-zA-ZáàâäéèêëíìîïóòôöúùûüçÇœŒæÆ-]+$/.test(val)) {
+            alert("Le mot ne doit contenir que des lettres ou un tiret.");
+            return false;
+        }
+        if (val.length < 2) {
+            alert("Le mot doit faire au moins 2 lettres.");
+            return false;
+        }
+        
+        // Vérification des lettres
+        const rackCopy = [...gameState.roundData[gameState.currentRound].letters];
+        const inputLetters = val.toUpperCase().split('');
+        let lettersMatch = true;
+        for (let char of inputLetters) {
+            const index = rackCopy.indexOf(char);
+            if (index === -1) {
+                lettersMatch = false;
+                break;
+            } else {
+                rackCopy.splice(index, 1);
+            }
+        }
+        if (!lettersMatch) {
+            alert(`Ton mot ne peut contenir que les lettres du tirage : ${gameState.roundData[gameState.currentRound].letters.join(', ')}`);
+            return false;
+        }
+    }
+    
+    if (gameState.currentPhase === 3) {
+        const officialWord = gameState.roundData[gameState.currentRound].word.toLowerCase();
+        if (!val.toLowerCase().includes(officialWord)) {
+            alert(`La phrase doit contenir le mot "${gameState.roundData[gameState.currentRound].word}".`);
+            return false;
+        }
+    }
+    
     return true;
 }
 
-function getActivePlayers() {
-    return gameState.players.filter(p => p.active);
-}
+// --- Écran de Transition (Pass & Play) ---
 
 function showTransitionScreenForInput() {
     const activePlayers = getActivePlayers();
     if (gameState.activePlayerIndex >= activePlayers.length) {
-        // Tous les joueurs actifs ont saisi leur proposition -> Phase de vote !
         initVotePhase();
         return;
     }
     
     const currentPlayer = activePlayers[gameState.activePlayerIndex];
-    
-    // Mettre à jour l'en-tête global
     updateGlobalHeader();
     
-    // Configurer l'écran de transition
     document.getElementById('transition-avatar').textContent = currentPlayer.name.charAt(0).toUpperCase();
     document.getElementById('transition-title').innerHTML = `C'est au tour de <span class="highlight-name">${currentPlayer.name}</span>`;
     
@@ -264,31 +978,33 @@ function showTransitionScreenForInput() {
     }
     document.getElementById('transition-instruction').textContent = instruction;
     
+    // Rétablir le clic standard
+    document.querySelector('#screen-transition .btn-primary').onclick = proceedToSaisie;
+    
     showScreen('transition');
 }
 
 function proceedToSaisie() {
     showScreen('saisie');
-    setupSaisieUI();
+    setupLocalSaisieUI();
 }
 
-function setupSaisieUI() {
+function setupLocalSaisieUI() {
     const activePlayers = getActivePlayers();
     const currentPlayer = activePlayers[gameState.activePlayerIndex];
     const round = gameState.currentRound;
     const phase = gameState.currentPhase;
     
-    // Titres et helper
     const promptTitle = document.getElementById('saisie-prompt-title');
     const contextArea = document.getElementById('saisie-context-area');
     const helperText = document.getElementById('saisie-helper-text');
     const inputLabel = document.getElementById('saisie-input-label');
     const inputField = document.getElementById('saisie-input');
     
+    inputField.disabled = false;
     inputField.value = "";
     
-    // Barre de progression
-    const progressPercent = ((gameState.activePlayerIndex) / activePlayers.length) * 100;
+    const progressPercent = (gameState.activePlayerIndex / activePlayers.length) * 100;
     document.getElementById('saisie-progress').style.width = `${progressPercent}%`;
     
     if (phase === 1) {
@@ -297,7 +1013,6 @@ function setupSaisieUI() {
         inputField.placeholder = "Tape ton mot inventé...";
         helperText.textContent = "Utilise les lettres ci-dessus. Pas de dictionnaire, fais jouer ta mauvaise foi !";
         
-        // Rendre les lettres sous forme de Scrabble
         const letters = gameState.roundData[round].letters;
         let html = '<div class="letters-rack">';
         letters.forEach((l, idx) => {
@@ -313,7 +1028,6 @@ function setupSaisieUI() {
         inputLabel.textContent = "Définition";
         inputField.placeholder = "Selon toi, que veut dire ce mot...";
         helperText.textContent = `Donne un sens convaincant ou absurde au mot officiel ci-dessus.`;
-        
         contextArea.innerHTML = `<div class="word-pill">${officialWord}</div>`;
         
     } else if (phase === 3) {
@@ -323,76 +1037,26 @@ function setupSaisieUI() {
         inputLabel.textContent = "Exemple de phrase";
         inputField.placeholder = "Tape ta phrase d'exemple...";
         helperText.textContent = `Utilise obligatoirement le mot "${officialWord}" dans ta phrase.`;
-        
         contextArea.innerHTML = `
             <div class="word-pill">${officialWord}</div>
             <p style="margin-top: 10px; font-style: italic; color: var(--text-main);">"${officialDef}"</p>
         `;
     }
     
-    // Focus l'input
+    document.getElementById('btn-submit-saisie').disabled = false;
+    document.getElementById('btn-submit-saisie').onclick = submitLocalSaisie;
+    
     setTimeout(() => inputField.focus(), 100);
     
-    // Gérer le Chronomètre
     startTimer(phase === 1 ? 30 : 90);
 }
 
-function handleSaisieKeydown(event) {
-    if (event.key === 'Enter') {
-        submitSaisie();
-    }
-}
-
-function submitSaisie() {
+function submitLocalSaisie() {
     const inputField = document.getElementById('saisie-input');
     const val = inputField.value.trim();
     
-    if (val === "") {
-        alert("Tu ne peux pas valider une proposition vide !");
-        return;
-    }
+    if (!validateSaisieInputLocal(val)) return;
     
-    // Validation spécifique pour la Phase 1 (uniquement des lettres et provenant du tirage)
-    if (gameState.currentPhase === 1) {
-        if (!/^[a-zA-ZáàâäéèêëíìîïóòôöúùûüçÇœŒæÆ-]+$/.test(val)) {
-            alert("Un mot ne doit contenir que des lettres ou un tiret ! Pas d'espaces ni de chiffres.");
-            return;
-        }
-        if (val.length < 2) {
-            alert("Ton mot doit faire au moins 2 lettres.");
-            return;
-        }
-        // Vérification hardcodée que le mot créé ne contient que les lettres du tirage
-        const rackCopy = [...gameState.roundData[gameState.currentRound].letters];
-        const inputLetters = val.toUpperCase().split('');
-        let lettersMatch = true;
-        for (let char of inputLetters) {
-            const index = rackCopy.indexOf(char);
-            if (index === -1) {
-                lettersMatch = false;
-                break;
-            } else {
-                rackCopy.splice(index, 1);
-            }
-        }
-        if (!lettersMatch) {
-            alert(`Ton mot ne peut contenir que les lettres du tirage de cette manche : ${gameState.roundData[gameState.currentRound].letters.join(', ')}`);
-            return;
-        }
-    }
-    
-    // Validation spécifique pour la Phase 3 (doit inclure le mot officiel)
-    if (gameState.currentPhase === 3) {
-        const officialWord = gameState.roundData[gameState.currentRound].word.toLowerCase();
-        // Regex simplifiée pour trouver le mot sans être trop strict sur la ponctuation autour
-        const normalizedVal = val.toLowerCase();
-        if (!normalizedVal.includes(officialWord)) {
-            alert(`Ta phrase doit impérativement contenir le mot "${gameState.roundData[gameState.currentRound].word}" !`);
-            return;
-        }
-    }
-    
-    // Enregistrer
     clearInterval(timerInterval);
     const activePlayers = getActivePlayers();
     const currentPlayer = activePlayers[gameState.activePlayerIndex];
@@ -402,12 +1066,153 @@ function submitSaisie() {
         text: val
     });
     
-    // Passer au joueur suivant
     gameState.activePlayerIndex++;
     showTransitionScreenForInput();
 }
 
-// --- Système de Chronomètre & Gestion de l'AFK ---
+// --- Timers Réseau (Hôte autoritaire) ---
+
+function startOnlineTimer(duration) {
+    clearInterval(timerInterval);
+    const wrapper = document.querySelector('.timer-wrapper');
+    const timerText = document.getElementById('timer-text');
+    const timerBar = document.getElementById('timer-bar');
+    
+    if (!gameState.timerEnabled) {
+        wrapper.style.display = 'none';
+        return;
+    }
+    
+    wrapper.style.display = 'block';
+    wrapper.classList.remove('timer-hurry');
+    
+    timerSecondsRemaining = duration;
+    timerText.textContent = timerSecondsRemaining;
+    timerBar.style.strokeDashoffset = 0;
+    
+    // Envoyer le tick initial
+    sendToAll({ type: 'TIMER_TICK', seconds: timerSecondsRemaining, total: duration });
+    
+    timerInterval = setInterval(() => {
+        timerSecondsRemaining--;
+        timerText.textContent = timerSecondsRemaining;
+        
+        const pct = timerSecondsRemaining / duration;
+        const offset = 283 * (1 - pct);
+        timerBar.style.strokeDashoffset = offset;
+        
+        if (timerSecondsRemaining <= 10) {
+            wrapper.classList.add('timer-hurry');
+        }
+        
+        // Envoyer la synchro
+        sendToAll({ type: 'TIMER_TICK', seconds: timerSecondsRemaining, total: duration });
+        
+        if (timerSecondsRemaining <= 0) {
+            clearInterval(timerInterval);
+            handleOnlineAFKTimeout();
+        }
+    }, 1000);
+}
+
+function handleOnlineAFKTimeout() {
+    // Vérifier qui n'a pas soumis de proposition
+    const activePlayers = getActivePlayers();
+    const inputField = document.getElementById('saisie-input');
+    
+    // Auto-saisie de l'Hôte si non vide
+    if (!gameState.propositions.some(p => p.playerId === 0)) {
+        const val = inputField.value.trim();
+        if (val !== "" && validateSaisieInputLocal(val)) {
+            gameState.propositions.push({ playerId: 0, text: val });
+        }
+    }
+    
+    // Traiter chaque joueur actif
+    activePlayers.forEach((player) => {
+        const hasSubmitted = gameState.propositions.some(p => p.playerId === player.id);
+        
+        if (!hasSubmitted) {
+            // Le joueur a-t-il une saisie non vide sur son écran ?
+            // L'Hôte ne peut pas lire l'écran des clients, mais au moment du timer=0
+            // on disqualifie les retardataires n'ayant pas reçu de proposition.
+            // (Note: La validation client a déjà été gérée au moment de l'expiration locale,
+            // si elle était non-vide, elle s'est auto-soumise à l'Hôte il y a 1s).
+            
+            // Disqualifier le client
+            player.active = false;
+            if (player.id !== 0) {
+                const conn = connections.get(player.id);
+                if (conn) {
+                    conn.send({ type: 'KICK', reason: "Temps écoulé ou proposition invalide (AFK)." });
+                    conn.close();
+                }
+            } else {
+                alert("💀 Vous avez été éliminé pour inactivité !");
+            }
+        }
+    });
+    
+    // Mettre à jour l'état de jeu
+    broadcastState();
+    
+    if (checkActivePlayersCount()) {
+        initVotePhase();
+    }
+}
+
+// --- Timers Clients (Fictif synchronisé) ---
+
+function startClientTimer(duration) {
+    clearInterval(timerInterval);
+    const wrapper = document.querySelector('.timer-wrapper');
+    const timerText = document.getElementById('timer-text');
+    const timerBar = document.getElementById('timer-bar');
+    
+    if (!gameState.timerEnabled) {
+        wrapper.style.display = 'none';
+        return;
+    }
+    
+    wrapper.style.display = 'block';
+    wrapper.classList.remove('timer-hurry');
+    
+    timerSecondsRemaining = duration;
+    timerText.textContent = timerSecondsRemaining;
+    timerBar.style.strokeDashoffset = 0;
+}
+
+function syncClientTimer(seconds, total) {
+    const timerText = document.getElementById('timer-text');
+    const timerBar = document.getElementById('timer-bar');
+    const wrapper = document.querySelector('.timer-wrapper');
+    
+    if (!wrapper) return;
+    
+    timerSecondsRemaining = seconds;
+    timerText.textContent = seconds;
+    
+    const pct = seconds / total;
+    const offset = 283 * (1 - pct);
+    timerBar.style.strokeDashoffset = offset;
+    
+    if (seconds <= 10) {
+        wrapper.classList.add('timer-hurry');
+    } else {
+        wrapper.classList.remove('timer-hurry');
+    }
+    
+    if (seconds <= 0) {
+        clearInterval(timerInterval);
+        // Si le champ est non vide, tenter de soumettre automatiquement avant l'exclusion
+        const inputField = document.getElementById('saisie-input');
+        if (!inputField.disabled && inputField.value.trim() !== "") {
+            submitClientSaisie();
+        }
+    }
+}
+
+// --- Timers Classique Local (Pass & Play) ---
 
 function startTimer(duration) {
     clearInterval(timerInterval);
@@ -425,15 +1230,12 @@ function startTimer(duration) {
     
     timerSecondsRemaining = duration;
     timerText.textContent = timerSecondsRemaining;
-    
-    // Dash offset initial
     timerBar.style.strokeDashoffset = 0;
     
     timerInterval = setInterval(() => {
         timerSecondsRemaining--;
         timerText.textContent = timerSecondsRemaining;
         
-        // Calcul de la barre de progression circulaire
         const pct = timerSecondsRemaining / duration;
         const offset = 283 * (1 - pct);
         timerBar.style.strokeDashoffset = offset;
@@ -455,15 +1257,12 @@ function handleAFKTimeout() {
     const inputField = document.getElementById('saisie-input');
     const val = inputField.value.trim();
     
-    // Si à la fin du timer le champ est non vide, le contenu est pris comme réponse si valide
     if (val !== "") {
         let isValid = true;
         if (gameState.currentPhase === 1) {
-            // Validation alphabet + tirets + longueur
             if (!/^[a-zA-ZáàâäéèêëíìîïóòôöúùûüçÇœŒæÆ-]+$/.test(val) || val.length < 2) {
                 isValid = false;
             } else {
-                // Validation des lettres imposées
                 const rackCopy = [...gameState.roundData[gameState.currentRound].letters];
                 const inputLetters = val.toUpperCase().split('');
                 for (let char of inputLetters) {
@@ -477,7 +1276,6 @@ function handleAFKTimeout() {
                 }
             }
         } else if (gameState.currentPhase === 3) {
-            // Validation présence du mot officiel
             const officialWord = gameState.roundData[gameState.currentRound].word.toLowerCase();
             if (!val.toLowerCase().includes(officialWord)) {
                 isValid = false;
@@ -485,7 +1283,6 @@ function handleAFKTimeout() {
         }
         
         if (isValid) {
-            // Validation automatique réussie !
             gameState.propositions.push({
                 playerId: currentPlayer.id,
                 text: val
@@ -497,62 +1294,208 @@ function handleAFKTimeout() {
         }
     }
     
-    // Sinon (vide ou invalide), exclure le joueur (Maudit)
     currentPlayer.active = false;
     alert(`💀 MALÉDICTION ! ${currentPlayer.name} n'a pas répondu à temps ou sa proposition en cours était invalide ! Il est exclu de la partie.`);
-    
-    // Nettoyer l'input
     document.getElementById('saisie-input').value = "";
     
     const newActivePlayers = getActivePlayers();
     if (gameState.activePlayerIndex >= newActivePlayers.length) {
-        gameState.activePlayerIndex = newActivePlayers.length; // Sera géré au prochain appel de showTransitionScreenForInput
+        gameState.activePlayerIndex = newActivePlayers.length;
     }
     
-    // Vérifier s'il reste assez de joueurs
     if (checkActivePlayersCount()) {
         showTransitionScreenForInput();
     }
 }
 
-// --- Phase de Vote (Pass-and-play secret) ---
+// ==========================================================================
+// 🗳️ LOGIQUE DES VOTES (Local & Réseau)
+// ==========================================================================
 
 function initVotePhase() {
+    gameState.gamePhase = 'VOTE';
     gameState.votes = [];
     gameState.activeVoterIndex = 0;
     
-    // Ne mélanger les cartes qu'au début de la phase de vote global (pas à chaque sous-vote)
-    // Sauf si on est en Mort Subite, là on filtre
     prepareVoteOptions();
     
-    showTransitionScreenForVote();
+    if (gameState.mode === 'LOCAL') {
+        showTransitionScreenForVote();
+    } else {
+        // Mode Réseau : Diffuser la phase de vote à tout le monde
+        const activePlayers = getActivePlayers();
+        
+        activePlayers.forEach((player) => {
+            // Anonymiser et exclure la propre carte de chaque joueur
+            const clientOpts = gameState.voteOptions.map(opt => ({
+                playerId: opt.playerId,
+                text: opt.text,
+                isOwn: opt.playerId === player.id
+            }));
+            
+            if (player.id !== 0) {
+                const conn = connections.get(player.id);
+                if (conn) {
+                    conn.send({
+                        type: 'VOTE_START',
+                        propositions: clientOpts,
+                        isMortSubite: gameState.isMortSubite
+                    });
+                }
+            } else {
+                // Configurer l'hôte localement
+                gameState.clientVoteOpts = clientOpts;
+                showScreen('vote');
+                setupOnlineHostVoteUI();
+            }
+        });
+    }
 }
 
 function prepareVoteOptions() {
     let rawOptions = [];
-    
     if (gameState.isMortSubite && gameState.mortSubiteTies) {
-        // En mort subite, on ne vote que pour les propositions à égalité
         rawOptions = gameState.propositions.filter(p => gameState.mortSubiteTies.includes(p.playerId));
     } else {
         rawOptions = gameState.propositions;
     }
-    
-    // Mélanger pour l'anonymat
     gameState.voteOptions = [...rawOptions].sort(() => Math.random() - 0.5);
 }
+
+// --- Saisie du Vote (Hôte en ligne) ---
+
+function setupOnlineHostVoteUI() {
+    const voterName = document.getElementById('vote-voter-name');
+    const container = document.getElementById('vote-cards-area');
+    const voteTitle = document.getElementById('vote-prompt-title');
+    
+    voterName.textContent = `Votant : Hôte`;
+    container.innerHTML = "";
+    
+    if (gameState.isMortSubite) {
+        voteTitle.innerHTML = `⚡ MORT SUBITE ⚡ Égalité ! Vote pour départager :`;
+    } else {
+        voteTitle.textContent = "Vote pour la meilleure proposition !";
+    }
+    
+    gameState.clientVoteOpts.forEach((opt) => {
+        const card = document.createElement('div');
+        card.className = `vote-card ${opt.isOwn ? 'disabled' : ''}`;
+        card.dataset.playerId = opt.playerId;
+        
+        let contentHtml = `<div class="vote-card-text">"${opt.text}"</div>`;
+        if (opt.isOwn) {
+            contentHtml += `<span class="own-badge">Ta proposition</span>`;
+        }
+        card.innerHTML = contentHtml;
+        
+        if (!opt.isOwn) {
+            card.onclick = () => selectVoteCard(card);
+        }
+        container.appendChild(card);
+    });
+    
+    document.getElementById('btn-submit-vote').disabled = true;
+    document.getElementById('btn-submit-vote').onclick = submitOnlineHostVote;
+}
+
+function submitOnlineHostVote() {
+    if (selectedVotePlayerId === null) return;
+    
+    gameState.votes.push({
+        voterId: 0,
+        targetId: selectedVotePlayerId
+    });
+    
+    selectedVotePlayerId = null;
+    
+    // Affichage d'attente sur l'Hôte
+    document.getElementById('vote-prompt-title').textContent = "Vote pris en compte !";
+    document.getElementById('vote-cards-area').innerHTML = "<div class='info-text'>En attente du vote des autres...</div>";
+    document.getElementById('btn-submit-vote').disabled = true;
+    
+    checkAllVotesSubmitted();
+}
+
+// --- Saisie du Vote (Client) ---
+
+function setupClientVoteUI() {
+    const voterName = document.getElementById('vote-voter-name');
+    const container = document.getElementById('vote-cards-area');
+    const voteTitle = document.getElementById('vote-prompt-title');
+    
+    voterName.textContent = `Votant : Toi`;
+    container.innerHTML = "";
+    
+    if (gameState.isMortSubite) {
+        voteTitle.innerHTML = `⚡ MORT SUBITE ⚡ Égalité ! Vote pour départager :`;
+    } else {
+        voteTitle.textContent = "Vote pour la meilleure proposition !";
+    }
+    
+    gameState.voteOptions.forEach((opt) => {
+        card = document.createElement('div');
+        card.className = `vote-card ${opt.isOwn ? 'disabled' : ''}`;
+        card.dataset.playerId = opt.playerId;
+        
+        let contentHtml = `<div class="vote-card-text">"${opt.text}"</div>`;
+        if (opt.isOwn) {
+            contentHtml += `<span class="own-badge">Ta proposition</span>`;
+        }
+        card.innerHTML = contentHtml;
+        
+        if (!opt.isOwn) {
+            card.onclick = () => selectVoteCard(card);
+        }
+        container.appendChild(card);
+    });
+    
+    document.getElementById('btn-submit-vote').disabled = true;
+    document.getElementById('btn-submit-vote').onclick = submitClientVote;
+}
+
+function submitClientVote() {
+    if (selectedVotePlayerId === null) return;
+    
+    myConnection.send({
+        type: 'SUBMIT_VOTE',
+        targetId: selectedVotePlayerId
+    });
+    
+    selectedVotePlayerId = null;
+    document.getElementById('vote-prompt-title').textContent = "Vote transmis !";
+    document.getElementById('vote-cards-area').innerHTML = "<div class='info-text'>En attente de l'Hôte...</div>";
+    document.getElementById('btn-submit-vote').disabled = true;
+}
+
+function registerOnlineVote(playerId, targetId) {
+    if (gameState.votes.some(v => v.voterId === playerId)) return;
+    
+    gameState.votes.push({
+        voterId: playerId,
+        targetId: targetId
+    });
+    
+    checkAllVotesSubmitted();
+}
+
+function checkAllVotesSubmitted() {
+    const activeCount = getActivePlayers().length;
+    if (gameState.votes.length >= activeCount) {
+        tallyVotes();
+    }
+}
+
+// --- Saisie du Vote (Local Pass-and-play) ---
 
 function showTransitionScreenForVote() {
     const activePlayers = getActivePlayers();
     if (gameState.activeVoterIndex >= activePlayers.length) {
-        // Tous les joueurs actifs ont voté -> Résolution des votes !
         tallyVotes();
         return;
     }
     
     const currentVoter = activePlayers[gameState.activeVoterIndex];
-    
-    // Titres de l'écran de transition
     document.getElementById('vote-transition-avatar').textContent = "🗳️";
     document.getElementById('vote-transition-instruction').textContent = `C'est au tour de ${currentVoter.name} de voter.`;
     
@@ -561,34 +1504,24 @@ function showTransitionScreenForVote() {
 
 function proceedToVote() {
     showScreen('vote');
-    setupVoteUI();
+    setupLocalVoteUI();
 }
 
-function setupVoteUI() {
+function setupLocalVoteUI() {
     const activePlayers = getActivePlayers();
     const currentVoter = activePlayers[gameState.activeVoterIndex];
     
     document.getElementById('vote-voter-name').textContent = `Votant : ${currentVoter.name}`;
-    
-    // Mots / Définitions à afficher
     const container = document.getElementById('vote-cards-area');
     container.innerHTML = "";
     
-    // Titre de consigne
     const voteTitle = document.getElementById('vote-prompt-title');
     if (gameState.isMortSubite) {
         voteTitle.innerHTML = `⚡ MORT SUBITE ⚡ Égalité ! Vote pour départager :`;
     } else {
-        if (gameState.currentPhase === 1) {
-            voteTitle.textContent = "Vote pour le meilleur mot !";
-        } else if (gameState.currentPhase === 2) {
-            voteTitle.textContent = `Quelle est la meilleure définition de "${gameState.roundData[gameState.currentRound].word}" ?`;
-        } else if (gameState.currentPhase === 3) {
-            voteTitle.textContent = "Quelle phrase est la plus drôle/adaptée ?";
-        }
+        voteTitle.textContent = "Vote pour la meilleure proposition !";
     }
     
-    // Générer les cartes
     gameState.voteOptions.forEach((opt) => {
         const isOwn = (opt.playerId === currentVoter.id);
         
@@ -600,35 +1533,19 @@ function setupVoteUI() {
         if (isOwn) {
             contentHtml += `<span class="own-badge">Ta proposition</span>`;
         }
-        
         card.innerHTML = contentHtml;
         
         if (!isOwn) {
             card.onclick = () => selectVoteCard(card);
         }
-        
         container.appendChild(card);
     });
     
-    // Désactiver le bouton de validation de base
     document.getElementById('btn-submit-vote').disabled = true;
+    document.getElementById('btn-submit-vote').onclick = submitLocalVote;
 }
 
-let selectedVotePlayerId = null;
-
-function selectVoteCard(card) {
-    // Déselectionner les autres
-    document.querySelectorAll('.vote-card').forEach(c => c.classList.remove('selected'));
-    
-    // Sélectionner celle-ci
-    card.classList.add('selected');
-    selectedVotePlayerId = parseInt(card.dataset.playerId);
-    
-    // Activer le bouton de validation
-    document.getElementById('btn-submit-vote').disabled = false;
-}
-
-function submitVote() {
+function submitLocalVote() {
     if (selectedVotePlayerId === null) return;
     
     const activePlayers = getActivePlayers();
@@ -641,32 +1558,27 @@ function submitVote() {
     
     selectedVotePlayerId = null;
     gameState.activeVoterIndex++;
-    
     showTransitionScreenForVote();
 }
 
-// --- Résolution des votes & Détermination du gagnant ---
+// --- Dépouillement des votes ---
 
 function tallyVotes() {
     const voteCounts = {};
-    
-    // Initialiser les compteurs
     const optionsToCount = gameState.isMortSubite ? gameState.mortSubiteTies : gameState.propositions.map(p => p.playerId);
+    
     optionsToCount.forEach(id => {
         voteCounts[id] = 0;
     });
     
-    // Compter
     gameState.votes.forEach(v => {
         if (voteCounts[v.targetId] !== undefined) {
             voteCounts[v.targetId]++;
         }
     });
     
-    // Trouver le maximum de votes
     let max = -1;
     let winners = [];
-    
     for (let id in voteCounts) {
         const count = voteCounts[id];
         if (count > max) {
@@ -677,33 +1589,25 @@ function tallyVotes() {
         }
     }
     
-    // Cas de la Mort Subite (Égalité)
     if (winners.length > 1) {
-        // Pour éviter une boucle infinie de Mort Subite locale si les joueurs font exprès d'égaliser
         if (gameState.mortSubiteCount >= 2) {
-            // Trancher de manière aléatoire
             const luckyWinner = winners[Math.floor(Math.random() * winners.length)];
-            alert(`⚠️ Encore une égalité ! Pour débloquer la partie, le destin a tiré un gagnant au sort.`);
+            alert(`⚠️ Match nul persistant. Le sort désigne un gagnant.`);
             applyWinner(luckyWinner);
         } else {
-            // Activer la Mort Subite
             gameState.isMortSubite = true;
             gameState.mortSubiteTies = winners;
             gameState.mortSubiteCount++;
             
-            alert(`⚡ ÉGALITÉ ! Une Mort Subite est déclenchée pour départager les gagnants !`);
-            
-            // Relancer les votes avec les cibles restreintes
+            alert(`⚡ Égalité ! Une Mort Subite est lancée.`);
             initVotePhase();
         }
     } else {
-        // Vainqueur unique !
         applyWinner(winners[0]);
     }
 }
 
 function applyWinner(winnerId) {
-    // Reset flags de Mort Subite
     gameState.isMortSubite = false;
     gameState.mortSubiteTies = null;
     gameState.mortSubiteCount = 0;
@@ -711,17 +1615,14 @@ function applyWinner(winnerId) {
     const phase = gameState.currentPhase;
     const round = gameState.currentRound;
     
-    // Retrouver la proposition gagnante
     const winningProp = gameState.propositions.find(p => p.playerId === winnerId);
     const author = gameState.players.find(p => p.id === winnerId);
     
-    // Assigner les scores et enregistrer dans l'historique de manche
     let points = 0;
     if (phase === 1) {
         points = 50;
         gameState.roundData[round].word = winningProp.text.toUpperCase();
         gameState.roundData[round].wordAuthor = winnerId;
-        // Ajouter le mot gagnant à la liste pour le cadavre exquis
         gameState.winningWordsList.push(winningProp.text.toUpperCase());
     } else if (phase === 2) {
         points = 100;
@@ -735,8 +1636,26 @@ function applyWinner(winnerId) {
     
     author.score += points;
     
-    // Afficher l'écran de révélation
-    showRevealScreen(winningProp.text, author.name, points);
+    if (gameState.mode === 'LOCAL') {
+        showRevealScreen(winningProp.text, author.name, points);
+    } else {
+        // En ligne : notifier tout le monde du gagnant et des scores
+        sendToAll({
+            type: 'REVEAL_WINNER',
+            text: winningProp.text,
+            authorName: author.name,
+            points: points,
+            scoreboard: gameState.players
+        });
+        
+        // Afficher l'Hôte localement
+        showRevealScreen(winningProp.text, author.name, points);
+        
+        // Réactiver le bouton continuer UNIQUEMENT pour l'Hôte
+        const btnNext = document.querySelector('#screen-reveal .scoreboard-panel .btn-primary');
+        btnNext.style.display = 'inline-flex';
+        btnNext.onclick = nextStepAfterReveal;
+    }
 }
 
 function showRevealScreen(winningText, authorName, pointsAdded) {
@@ -746,37 +1665,10 @@ function showRevealScreen(winningText, authorName, pointsAdded) {
     document.getElementById('reveal-winner-author').textContent = authorName;
     document.getElementById('reveal-points-added').textContent = pointsAdded;
     
-    // Générer le tableau des scores
     renderScoreboard();
     
-    // Confettis !
     if (stopConfettiFn) stopConfettiFn();
     stopConfettiFn = startConfetti('confetti-canvas');
-}
-
-function renderScoreboard() {
-    const list = document.getElementById('scoreboard-list');
-    list.innerHTML = "";
-    
-    // Trier les joueurs par score (les maudits en bas)
-    const sorted = [...gameState.players].sort((a, b) => {
-        if (!a.active && b.active) return 1;
-        if (a.active && !b.active) return -1;
-        return b.score - a.score;
-    });
-    
-    sorted.forEach((p, idx) => {
-        const row = document.createElement('div');
-        row.className = `score-row ${!p.active ? 'cursed' : ''}`;
-        row.innerHTML = `
-            <div class="score-player-name">
-                <span class="score-player-rank">${idx + 1}</span>
-                ${p.name}
-            </div>
-            <div class="score-player-val">${p.score} pts</div>
-        `;
-        list.innerHTML += row.outerHTML;
-    });
 }
 
 function nextStepAfterReveal() {
@@ -785,74 +1677,96 @@ function nextStepAfterReveal() {
         stopConfettiFn = null;
     }
     
-    // Passer à l'étape suivante
     if (gameState.currentPhase < 3) {
         gameState.currentPhase++;
         initSaisiePhase();
     } else {
-        // Fin de la manche
         if (gameState.currentRound < gameState.roundCount) {
             gameState.currentRound++;
             startNewRound();
         } else {
-            // Toutes les manches sont terminées -> Cadavre Exquis !
             initCadavreExquisPhase();
         }
     }
 }
 
-// --- Phase Cadavre Exquis (Narratif) ---
+// ==========================================================================
+// ✍️ NARRATION CADAVRE EXQUIS (Séquentiel pour les deux modes)
+// ==========================================================================
 
 function initCadavreExquisPhase() {
+    gameState.gamePhase = 'CADAVRE';
     gameState.cadavreSentences = [];
     gameState.activeCadavreIndex = 0;
     
-    // Masquer le header
     document.getElementById('global-header').classList.add('hidden');
     
     if (!checkActivePlayersCount()) return;
     
-    showCadavreExquisTransition();
+    if (gameState.mode === 'LOCAL') {
+        showCadavreExquisTransition();
+    } else {
+        // En ligne : l'Hôte orchestrera les tours un par un
+        triggerNextOnlineCadavreTurn();
+    }
 }
 
-function showCadavreExquisTransition() {
+// --- Séquençage Cadavre Exquis (Réseau) ---
+
+function triggerNextOnlineCadavreTurn() {
     const activePlayers = getActivePlayers();
+    
     if (gameState.activeCadavreIndex >= activePlayers.length) {
-        // Tous les joueurs ont rédigé -> Révélation de l'histoire et vote final !
-        initCadavreRevealPhase();
+        // Tous ont rédigé -> Révélation et vote
+        initOnlineCadavreReveal();
         return;
     }
     
     const currentPlayer = activePlayers[gameState.activeCadavreIndex];
     
-    document.getElementById('transition-avatar').textContent = "✍️";
-    document.getElementById('transition-title').innerHTML = `C'est au tour de <span class="highlight-name">${currentPlayer.name}</span>`;
-    document.getElementById('transition-instruction').textContent = "Tu vas devoir ajouter une phrase pour le Cadavre Exquis final !";
+    // Obtenir le texte à "apercevoir"
+    let peekText = "";
+    if (gameState.cadavreSentences.length > 0) {
+        const lastText = gameState.cadavreSentences[gameState.cadavreSentences.length - 1].text;
+        const peekLen = 25;
+        peekText = lastText.length > peekLen ? `... ${lastText.substring(lastText.length - peekLen)}` : lastText;
+    }
     
-    // Rediriger le clic de transition vers l'écran cadavre
-    const btnReady = document.querySelector('#screen-transition .btn-primary');
-    btnReady.onclick = () => {
-        showScreen('cadavreExquis');
-        setupCadavreUI();
-    };
-    
-    showScreen('transition');
+    // Notifier tout le monde
+    activePlayers.forEach((player) => {
+        const isCurrentWriter = (player.id === currentPlayer.id);
+        
+        if (player.id !== 0) {
+            const conn = connections.get(player.id);
+            if (conn) {
+                if (isCurrentWriter) {
+                    conn.send({
+                        type: 'CADAVRE_START',
+                        peekText: peekText,
+                        winningWords: gameState.winningWordsList,
+                        duration: 90
+                    });
+                } else {
+                    conn.send({
+                        type: 'CADAVRE_WAIT',
+                        writerName: currentPlayer.name
+                    });
+                }
+            }
+        } else {
+            // Configurer l'hôte
+            if (isCurrentWriter) {
+                showScreen('cadavreExquis');
+                setupOnlineHostCadavreUI(peekText, 90);
+            } else {
+                showScreen('cadavreExquis');
+                setupClientCadavreWaitUI(currentPlayer.name);
+            }
+        }
+    });
 }
 
-function setupCadavreUI() {
-    // Restaurer le clic par défaut du bouton de transition au cas où
-    setTimeout(() => {
-        document.querySelector('#screen-transition .btn-primary').onclick = proceedToSaisie;
-    }, 500);
-    
-    const activePlayers = getActivePlayers();
-    const currentPlayer = activePlayers[gameState.activeCadavreIndex];
-    
-    // Progression
-    const progressPercent = (gameState.activeCadavreIndex / activePlayers.length) * 100;
-    document.getElementById('cadavre-progress').style.width = `${progressPercent}%`;
-    
-    // Mots gagnants sélectionnables
+function setupOnlineHostCadavreUI(peekText, duration) {
     const wordsRack = document.getElementById('cadavre-words-list');
     wordsRack.innerHTML = "";
     gameState.winningWordsList.forEach(word => {
@@ -864,7 +1778,188 @@ function setupCadavreUI() {
         wordsRack.appendChild(pill);
     });
     
-    // Gérer l'aperçu du texte précédent (Pass-and-play aveugle)
+    const peekBox = document.getElementById('cadavre-peek-box');
+    const peekTextEl = document.getElementById('cadavre-peek-text');
+    
+    if (peekText === "") {
+        peekBox.style.display = 'none';
+    } else {
+        peekBox.style.display = 'block';
+        peekTextEl.textContent = peekText;
+    }
+    
+    const textarea = document.getElementById('cadavre-textarea');
+    textarea.disabled = false;
+    textarea.value = "";
+    
+    document.getElementById('btn-submit-cadavre').onclick = submitOnlineHostCadavre;
+    
+    validateCadavreInput();
+    startCadavreTimer(duration);
+    setTimeout(() => textarea.focus(), 100);
+}
+
+function submitOnlineHostCadavre() {
+    clearInterval(timerInterval);
+    const textarea = document.getElementById('cadavre-textarea');
+    const val = textarea.value.trim();
+    
+    let usedWord = "";
+    for (let word of gameState.winningWordsList) {
+        if (val.toLowerCase().includes(word.toLowerCase())) {
+            usedWord = word;
+            break;
+        }
+    }
+    
+    gameState.cadavreSentences.push({
+        playerId: 0,
+        text: val,
+        usedWord: usedWord
+    });
+    
+    gameState.activeCadavreIndex++;
+    triggerNextOnlineCadavreTurn();
+}
+
+function registerOnlineCadavre(playerId, text, usedWord) {
+    clearInterval(timerInterval);
+    
+    // Ignorer si déjà soumis
+    if (gameState.cadavreSentences.some(s => s.playerId === playerId)) return;
+    
+    gameState.cadavreSentences.push({
+        playerId: playerId,
+        text: text,
+        usedWord: usedWord
+    });
+    
+    gameState.activeCadavreIndex++;
+    triggerNextOnlineCadavreTurn();
+}
+
+// --- Cadavre Exquis (Clients UIs) ---
+
+function setupClientCadavreUI(peekText, duration) {
+    const wordsRack = document.getElementById('cadavre-words-list');
+    wordsRack.innerHTML = "";
+    gameState.winningWordsList.forEach(word => {
+        const pill = document.createElement('button');
+        pill.type = "button";
+        pill.className = "word-pill";
+        pill.textContent = word;
+        pill.onclick = () => insertWordInCadavre(word);
+        wordsRack.appendChild(pill);
+    });
+    
+    const peekBox = document.getElementById('cadavre-peek-box');
+    const peekTextEl = document.getElementById('cadavre-peek-text');
+    
+    if (peekText === "") {
+        peekBox.style.display = 'none';
+    } else {
+        peekBox.style.display = 'block';
+        peekTextEl.textContent = peekText;
+    }
+    
+    const textarea = document.getElementById('cadavre-textarea');
+    textarea.disabled = false;
+    textarea.value = "";
+    
+    document.getElementById('btn-submit-cadavre').onclick = submitClientCadavre;
+    
+    validateCadavreInput();
+    
+    // Affichage timer fictif
+    const timerBox = document.getElementById('cadavre-timer');
+    timerBox.style.display = 'block';
+    document.getElementById('cadavre-timer-value').textContent = duration;
+    
+    setTimeout(() => textarea.focus(), 100);
+}
+
+function setupClientCadavreWaitUI(writerName) {
+    // Mode veille pendant qu'un autre écrit
+    const wordsRack = document.getElementById('cadavre-words-list');
+    wordsRack.innerHTML = "<div class='info-text'>Attente du tour...</div>";
+    
+    const peekBox = document.getElementById('cadavre-peek-box');
+    peekBox.style.display = 'block';
+    document.getElementById('cadavre-peek-text').textContent = `${writerName} est en train d'écrire la suite de l'histoire...`;
+    
+    const textarea = document.getElementById('cadavre-textarea');
+    textarea.disabled = true;
+    textarea.value = "";
+    
+    document.getElementById('cadavre-timer').style.display = 'none';
+    document.getElementById('btn-submit-cadavre').disabled = true;
+}
+
+function submitClientCadavre() {
+    const textarea = document.getElementById('cadavre-textarea');
+    const val = textarea.value.trim();
+    
+    let usedWord = "";
+    for (let word of gameState.winningWordsList) {
+        if (val.toLowerCase().includes(word.toLowerCase())) {
+            usedWord = word;
+            break;
+        }
+    }
+    
+    if (!usedWord) return; // Sécurité validation
+    
+    myConnection.send({
+        type: 'SUBMIT_CADAVRE',
+        text: val,
+        usedWord: usedWord
+    });
+    
+    textarea.disabled = true;
+    document.getElementById('btn-submit-cadavre').disabled = true;
+    document.getElementById('cadavre-peek-text').textContent = "Proposition envoyée ! Attente du joueur suivant...";
+}
+
+// --- Cadavre Exquis (Mode Local Pass-and-play) ---
+
+function showCadavreExquisTransition() {
+    const activePlayers = getActivePlayers();
+    if (gameState.activeCadavreIndex >= activePlayers.length) {
+        initLocalCadavreReveal();
+        return;
+    }
+    
+    const currentPlayer = activePlayers[gameState.activeCadavreIndex];
+    document.getElementById('transition-avatar').textContent = "✍️";
+    document.getElementById('transition-title').innerHTML = `C'est au tour de <span class="highlight-name">${currentPlayer.name}</span>`;
+    document.getElementById('transition-instruction').textContent = "Tu vas devoir ajouter une phrase pour le Cadavre Exquis final !";
+    
+    const btnReady = document.querySelector('#screen-transition .btn-primary');
+    btnReady.onclick = () => {
+        showScreen('cadavreExquis');
+        setupLocalCadavreUI();
+    };
+    showScreen('transition');
+}
+
+function setupLocalCadavreUI() {
+    const activePlayers = getActivePlayers();
+    const currentPlayer = activePlayers[gameState.activeCadavreIndex];
+    
+    const progressPercent = (gameState.activeCadavreIndex / activePlayers.length) * 100;
+    document.getElementById('cadavre-progress').style.width = `${progressPercent}%`;
+    
+    const wordsRack = document.getElementById('cadavre-words-list');
+    wordsRack.innerHTML = "";
+    gameState.winningWordsList.forEach(word => {
+        const pill = document.createElement('button');
+        pill.type = "button";
+        pill.className = "word-pill";
+        pill.textContent = word;
+        pill.onclick = () => insertWordInCadavre(word);
+        wordsRack.appendChild(pill);
+    });
+    
     const peekBox = document.getElementById('cadavre-peek-box');
     const peekText = document.getElementById('cadavre-peek-text');
     
@@ -873,150 +1968,26 @@ function setupCadavreUI() {
     } else {
         peekBox.style.display = 'block';
         const lastSentence = gameState.cadavreSentences[gameState.cadavreSentences.length - 1].text;
-        
-        // N'afficher que la fin (les 25 derniers caractères)
         const peekLen = 25;
-        if (lastSentence.length > peekLen) {
-            peekText.textContent = `... ${lastSentence.substring(lastSentence.length - peekLen)}`;
-        } else {
-            peekText.textContent = lastSentence;
-        }
+        peekText.textContent = lastSentence.length > peekLen ? `... ${lastSentence.substring(lastSentence.length - peekLen)}` : lastSentence;
     }
     
-    // Champ de texte
     const textarea = document.getElementById('cadavre-textarea');
+    textarea.disabled = false;
     textarea.value = "";
     
+    document.getElementById('btn-submit-cadavre').onclick = submitLocalCadavre;
+    
     validateCadavreInput();
-    
-    // Chronomètre du cadavre exquis (90s)
     startCadavreTimer(90);
-    
     setTimeout(() => textarea.focus(), 100);
 }
 
-function insertWordInCadavre(word) {
-    const textarea = document.getElementById('cadavre-textarea');
-    const start = textarea.selectionStart;
-    const end = textarea.selectionEnd;
-    const text = textarea.value;
-    
-    textarea.value = text.substring(0, start) + word + text.substring(end);
-    textarea.focus();
-    // Positionner le curseur juste après le mot inséré
-    textarea.selectionStart = textarea.selectionEnd = start + word.length;
-    
-    validateCadavreInput();
-}
-
-function validateCadavreInput() {
-    const textarea = document.getElementById('cadavre-textarea');
-    const text = textarea.value.trim().toLowerCase();
-    const validationMsg = document.getElementById('cadavre-validation-msg');
-    const btnSubmit = document.getElementById('btn-submit-cadavre');
-    
-    if (text === "") {
-        validationMsg.textContent = "❌ Ta phrase ne peut pas être vide.";
-        validationMsg.className = "helper-note";
-        btnSubmit.disabled = true;
-        return;
-    }
-    
-    // Vérifier la présence d'au moins un mot gagnant
-    let foundWord = null;
-    for (let word of gameState.winningWordsList) {
-        if (text.includes(word.toLowerCase())) {
-            foundWord = word;
-            break;
-        }
-    }
-    
-    if (foundWord) {
-        validationMsg.textContent = `✅ Valide (Mot utilisé : ${foundWord})`;
-        validationMsg.className = "helper-note valid";
-        btnSubmit.disabled = false;
-    } else {
-        validationMsg.textContent = "❌ Ta contribution doit inclure au moins l'un des mots de la liste.";
-        validationMsg.className = "helper-note";
-        btnSubmit.disabled = true;
-    }
-}
-
-function startCadavreTimer(duration) {
-    clearInterval(timerInterval);
-    const timerText = document.getElementById('cadavre-timer-value');
-    const timerBox = document.getElementById('cadavre-timer');
-    
-    if (!gameState.timerEnabled) {
-        timerBox.style.display = 'none';
-        return;
-    }
-    
-    timerBox.style.display = 'block';
-    timerSecondsRemaining = duration;
-    timerText.textContent = timerSecondsRemaining;
-    
-    timerInterval = setInterval(() => {
-        timerSecondsRemaining--;
-        timerText.textContent = timerSecondsRemaining;
-        
-        if (timerSecondsRemaining <= 0) {
-            clearInterval(timerInterval);
-            handleCadavreAFK();
-        }
-    }, 1000);
-}
-
-function handleCadavreAFK() {
-    const activePlayers = getActivePlayers();
-    const currentPlayer = activePlayers[gameState.activeCadavreIndex];
-    const textarea = document.getElementById('cadavre-textarea');
-    const val = textarea.value.trim();
-    
-    // Si à la fin du timer le champ est non vide, le contenu est pris comme réponse si valide
-    if (val !== "") {
-        let usedWord = "";
-        for (let word of gameState.winningWordsList) {
-            if (val.toLowerCase().includes(word.toLowerCase())) {
-                usedWord = word;
-                break;
-            }
-        }
-        
-        if (usedWord) {
-            clearInterval(timerInterval);
-            gameState.cadavreSentences.push({
-                playerId: currentPlayer.id,
-                text: val,
-                usedWord: usedWord
-            });
-            alert(`⏳ Temps écoulé ! La contribution de ${currentPlayer.name} ("${val}") a été enregistrée automatiquement.`);
-            gameState.activeCadavreIndex++;
-            showCadavreExquisTransition();
-            return;
-        }
-    }
-    
-    currentPlayer.active = false;
-    alert(`💀 EXCLU ! ${currentPlayer.name} a été trop lent à écrire ou sa proposition en cours ne contenait aucun mot gagnant !`);
-    
-    // Pas d'incrément sur activeCadavreIndex car la liste se décale
-    const newActive = getActivePlayers();
-    if (gameState.activeCadavreIndex >= newActive.length) {
-        gameState.activeCadavreIndex = newActive.length;
-    }
-    
-    if (checkActivePlayersCount()) {
-        showCadavreExquisTransition();
-    }
-}
-
-function submitCadavreSentence() {
+function submitLocalCadavre() {
     clearInterval(timerInterval);
     const textarea = document.getElementById('cadavre-textarea');
     const val = textarea.value.trim();
     
-    // Trouver le mot utilisé pour le surlignage futur
     let usedWord = "";
     for (let word of gameState.winningWordsList) {
         if (val.toLowerCase().includes(word.toLowerCase())) {
@@ -1038,59 +2009,205 @@ function submitCadavreSentence() {
     showCadavreExquisTransition();
 }
 
-// --- Révélation Histoire & Vote Final ---
+function insertWordInCadavre(word) {
+    const textarea = document.getElementById('cadavre-textarea');
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    const text = textarea.value;
+    
+    textarea.value = text.substring(0, start) + word + text.substring(end);
+    textarea.focus();
+    textarea.selectionStart = textarea.selectionEnd = start + word.length;
+    
+    validateCadavreInput();
+}
 
-function initCadavreRevealPhase() {
+function validateCadavreInput() {
+    const textarea = document.getElementById('cadavre-textarea');
+    const text = textarea.value.trim().toLowerCase();
+    const validationMsg = document.getElementById('cadavre-validation-msg');
+    const btnSubmit = document.getElementById('btn-submit-cadavre');
+    
+    if (text === "") {
+        validationMsg.textContent = "❌ Ta phrase ne peut pas être vide.";
+        validationMsg.className = "helper-note";
+        btnSubmit.disabled = true;
+        return;
+    }
+    
+    let foundWord = null;
+    for (let word of gameState.winningWordsList) {
+        if (text.includes(word.toLowerCase())) {
+            foundWord = word;
+            break;
+        }
+    }
+    
+    if (foundWord) {
+        validationMsg.textContent = `✅ Valide (Mot utilisé : ${foundWord})`;
+        validationMsg.className = "helper-note valid";
+        btnSubmit.disabled = false;
+    } else {
+        validationMsg.textContent = "❌ Ta contribution doit inclure au moins l'un des mots de la liste.";
+        validationMsg.className = "helper-note";
+        btnSubmit.disabled = true;
+    }
+}
+
+// --- Timers Cadavre Exquis (Hôte autoritaire) ---
+
+function startCadavreTimer(duration) {
+    clearInterval(timerInterval);
+    const timerText = document.getElementById('cadavre-timer-value');
+    const timerBox = document.getElementById('cadavre-timer');
+    
+    if (!gameState.timerEnabled) {
+        timerBox.style.display = 'none';
+        return;
+    }
+    
+    timerBox.style.display = 'block';
+    timerSecondsRemaining = duration;
+    timerText.textContent = timerSecondsRemaining;
+    
+    // Envoyer la synchro initiale s'il y a des clients
+    if (gameState.mode === 'ONLINE' && gameState.isHost) {
+        sendToAll({ type: 'TIMER_TICK', seconds: timerSecondsRemaining, total: duration });
+    }
+    
+    timerInterval = setInterval(() => {
+        timerSecondsRemaining--;
+        timerText.textContent = timerSecondsRemaining;
+        
+        if (gameState.mode === 'ONLINE' && gameState.isHost) {
+            sendToAll({ type: 'TIMER_TICK', seconds: timerSecondsRemaining, total: duration });
+        }
+        
+        if (timerSecondsRemaining <= 0) {
+            clearInterval(timerInterval);
+            handleCadavreAFK();
+        }
+    }, 1000);
+}
+
+function handleCadavreAFK() {
+    const activePlayers = getActivePlayers();
+    
+    if (gameState.mode === 'LOCAL') {
+        const currentPlayer = activePlayers[gameState.activeCadavreIndex];
+        const textarea = document.getElementById('cadavre-textarea');
+        const val = textarea.value.trim();
+        
+        if (val !== "") {
+            let usedWord = "";
+            for (let word of gameState.winningWordsList) {
+                if (val.toLowerCase().includes(word.toLowerCase())) {
+                    usedWord = word;
+                    break;
+                }
+            }
+            if (usedWord) {
+                gameState.cadavreSentences.push({ playerId: currentPlayer.id, text: val, usedWord: usedWord });
+                alert(`⏳ Temps écoulé ! La contribution de ${currentPlayer.name} ("${val}") a été enregistrée automatiquement.`);
+                gameState.activeCadavreIndex++;
+                showCadavreExquisTransition();
+                return;
+            }
+        }
+        
+        currentPlayer.active = false;
+        alert(`💀 EXCLU ! ${currentPlayer.name} a été trop lent à écrire ou sa proposition était invalide.`);
+        
+        const newActive = getActivePlayers();
+        if (gameState.activeCadavreIndex >= newActive.length) {
+            gameState.activeCadavreIndex = newActive.length;
+        }
+        if (checkActivePlayersCount()) {
+            showCadavreExquisTransition();
+        }
+    } else {
+        // En ligne (Hôte gère l'AFK du rédacteur actif)
+        const currentPlayer = activePlayers[gameState.activeCadavreIndex];
+        
+        // Si Hôte et non-vide, auto-validation locale
+        if (gameState.activeCadavreIndex === 0) {
+            const textarea = document.getElementById('cadavre-textarea');
+            const val = textarea.value.trim();
+            let usedWord = "";
+            for (let word of gameState.winningWordsList) {
+                if (val.toLowerCase().includes(word.toLowerCase())) {
+                    usedWord = word;
+                    break;
+                }
+            }
+            if (usedWord) {
+                gameState.cadavreSentences.push({ playerId: 0, text: val, usedWord: usedWord });
+                gameState.activeCadavreIndex++;
+                triggerNextOnlineCadavreTurn();
+                return;
+            }
+        }
+        
+        // Exclure le joueur
+        currentPlayer.active = false;
+        if (currentPlayer.id !== 0) {
+            const conn = connections.get(currentPlayer.id);
+            if (conn) {
+                conn.send({ type: 'KICK', reason: "Temps écoulé au cadavre exquis." });
+                conn.close();
+            }
+        } else {
+            alert("Disqualifié pour inactivité.");
+        }
+        
+        broadcastState();
+        
+        const newActive = getActivePlayers();
+        if (gameState.activeCadavreIndex >= newActive.length) {
+            gameState.activeCadavreIndex = newActive.length;
+        }
+        if (checkActivePlayersCount()) {
+            triggerNextOnlineCadavreTurn();
+        }
+    }
+}
+
+// ==========================================================================
+// 📖 RÉVÉLATION HISTOIRE ET VOTE CADAVRE
+// ==========================================================================
+
+function initLocalCadavreReveal() {
     showScreen('cadavreReveal');
     gameState.cadavreVotes = [];
+    currentStoryVoterIdx = 0;
     
-    // 1. Construire l'histoire complète avec des tooltips sur les mots inventés
-    const storyDiv = document.getElementById('story-full-text');
-    storyDiv.innerHTML = "";
-    
-    // On va mapper les définitions pour les infobulles (tooltips)
+    // Définitions
     const definitionsMap = {};
     for (let r in gameState.roundData) {
         const data = gameState.roundData[r];
         definitionsMap[data.word.toUpperCase()] = data.definition;
     }
     
+    const storyDiv = document.getElementById('story-full-text');
+    storyDiv.innerHTML = "";
     let fullStoryHtml = "";
     gameState.cadavreSentences.forEach((sentence, idx) => {
         let sentenceText = sentence.text;
-        
-        // Remplacer le mot utilisé par sa version surlignée avec infobulle
         if (sentence.usedWord) {
             const wordUpper = sentence.usedWord.toUpperCase();
-            const defText = definitionsMap[wordUpper] || "Pas de définition trouvée.";
-            
-            // Remplacement insensible à la casse
+            const defText = definitionsMap[wordUpper] || "";
             const regex = new RegExp(`(${sentence.usedWord})`, 'gi');
             sentenceText = sentenceText.replace(regex, `<span class="story-word-highlight" data-tooltip="${wordUpper} : ${defText}">$1</span>`);
         }
-        
-        // Ajouter un petit effet de retard pour l'affichage graduel (facultatif mais cool)
         fullStoryHtml += `<span class="story-paragraph" style="animation-delay: ${idx * 0.5}s">${sentenceText} </span>`;
     });
-    
     storyDiv.innerHTML = fullStoryHtml;
     
-    // 2. Construire la zone de vote pour les joueurs du cadavre
-    const voteArea = document.getElementById('story-vote-players-area');
-    voteArea.innerHTML = "";
-    
-    // Chaque joueur actif doit pouvoir voter pour le meilleur contributeur
-    // Pour simplifier et ne pas avoir une boucle infinie de transition, on fait un vote à main levée ou séquentiel
-    // Mais pour garder l'aspect Pass-and-play, on va faire un vote "chacun son tour" simplifié à l'écran
-    // Ou un écran de transition rapide. Pour faire simple et efficace dans l'UI :
-    // On affiche des boutons "Voter en tant que [Pseudo]" qui ouvrent un mini-prompt ou qui masquent temporairement.
-    // Mettons en place une mécanique de boutons séquentiels de vote :
-    renderStoryVoteButtons();
+    // Lancer le vote local
+    renderLocalStoryVoteButtons();
 }
 
-let currentStoryVoterIdx = 0;
-
-function renderStoryVoteButtons() {
+function renderLocalStoryVoteButtons() {
     const activePlayers = getActivePlayers();
     const voteArea = document.getElementById('story-vote-players-area');
     const statusText = document.getElementById('story-vote-status-text');
@@ -1098,7 +2215,6 @@ function renderStoryVoteButtons() {
     voteArea.innerHTML = "";
     
     if (currentStoryVoterIdx >= activePlayers.length) {
-        // Tous ont voté ! Calculer le vainqueur du Cadavre Exquis
         tallyCadavreVotes();
         return;
     }
@@ -1106,7 +2222,6 @@ function renderStoryVoteButtons() {
     const currentVoter = activePlayers[currentStoryVoterIdx];
     statusText.textContent = `Au tour de ${currentVoter.name} de voter...`;
     
-    // Afficher des boutons pour chaque AUTRE joueur
     activePlayers.forEach(player => {
         const isSelf = (player.id === currentVoter.id);
         
@@ -1123,18 +2238,141 @@ function renderStoryVoteButtons() {
                     targetId: player.id
                 });
                 currentStoryVoterIdx++;
-                renderStoryVoteButtons();
+                renderLocalStoryVoteButtons();
             };
         }
-        
         voteArea.appendChild(btn);
     });
+}
+
+// --- Révélation Histoire (En ligne) ---
+
+function initOnlineCadavreReveal() {
+    gameState.gamePhase = 'STORY_VOTE';
+    gameState.cadavreVotes = [];
+    currentStoryVoterIdx = 0;
+    
+    // Construire la map des définitions
+    const definitionsMap = {};
+    for (let r in gameState.roundData) {
+        const data = gameState.roundData[r];
+        definitionsMap[data.word.toUpperCase()] = data.definition;
+    }
+    
+    const activePlayers = getActivePlayers();
+    
+    // Diffuser aux clients
+    sendToAll({
+        type: 'STORY_REVEAL',
+        sentences: gameState.cadavreSentences,
+        definitionsMap: definitionsMap,
+        activePlayers: activePlayers
+    });
+    
+    // Afficher l'Hôte
+    showScreen('cadavreReveal');
+    renderOnlineStoryText(gameState.cadavreSentences, definitionsMap);
+    renderOnlineStoryVoteArea(activePlayers);
+}
+
+function renderOnlineStoryText(sentences, definitionsMap) {
+    const storyDiv = document.getElementById('story-full-text');
+    storyDiv.innerHTML = "";
+    
+    let fullStoryHtml = "";
+    sentences.forEach((sentence, idx) => {
+        let sentenceText = sentence.text;
+        if (sentence.usedWord) {
+            const wordUpper = sentence.usedWord.toUpperCase();
+            const defText = definitionsMap[wordUpper] || "";
+            const regex = new RegExp(`(${sentence.usedWord})`, 'gi');
+            sentenceText = sentenceText.replace(regex, `<span class="story-word-highlight" data-tooltip="${wordUpper} : ${defText}">$1</span>`);
+        }
+        fullStoryHtml += `<span class="story-paragraph" style="animation-delay: ${idx * 0.4}s">${sentenceText} </span>`;
+    });
+    storyDiv.innerHTML = fullStoryHtml;
+}
+
+function renderOnlineStoryVoteArea(activePlayers) {
+    const voteArea = document.getElementById('story-vote-players-area');
+    voteArea.innerHTML = "";
+    
+    const currentVoter = activePlayers[currentStoryVoterIdx];
+    const statusText = document.getElementById('story-vote-status-text');
+    
+    const isMyTurn = (currentVoter.id === gameState.myPlayerId);
+    statusText.textContent = `Au tour de ${currentVoter.name} de voter...`;
+    
+    activePlayers.forEach(player => {
+        const isSelf = (player.id === gameState.myPlayerId);
+        const isVoterSelf = (player.id === currentVoter.id);
+        
+        const btn = document.createElement('button');
+        btn.type = "button";
+        // Si c'est à moi de voter et que ce n'est pas moi-même
+        const canClick = isMyTurn && !isVoterSelf;
+        
+        btn.className = `btn-story-vote ${(!canClick) ? 'disabled' : ''}`;
+        btn.innerHTML = `Voter pour <strong>${player.name}</strong> <span>👍</span>`;
+        btn.disabled = !canClick;
+        
+        if (canClick) {
+            btn.onclick = () => {
+                if (gameState.isHost) {
+                    registerOnlineStoryVote(0, player.id);
+                } else {
+                    myConnection.send({
+                        type: 'SUBMIT_STORY_VOTE',
+                        targetId: player.id
+                    });
+                }
+                
+                // Désactiver localement après clic
+                document.querySelectorAll('.btn-story-vote').forEach(b => b.classList.add('disabled'));
+            };
+        }
+        voteArea.appendChild(btn);
+    });
+}
+
+function registerOnlineStoryVote(voterId, targetId) {
+    if (gameState.cadavreVotes.some(v => v.voterId === voterId)) return;
+    
+    gameState.cadavreVotes.push({
+        voterId: voterId,
+        targetId: targetId
+    });
+    
+    currentStoryVoterIdx++;
+    
+    const activePlayers = getActivePlayers();
+    
+    if (currentStoryVoterIdx >= activePlayers.length) {
+        tallyCadavreVotes();
+    } else {
+        // Mettre à jour tout le monde pour le votant suivant
+        sendToAll({
+            type: 'STORY_VOTE_TICK',
+            currentVoterName: activePlayers[currentStoryVoterIdx].name,
+            activePlayers: activePlayers
+        });
+        
+        // Mettre à jour l'hôte
+        renderOnlineStoryVoteArea(activePlayers);
+    }
+}
+
+function updateOnlineStoryVoteStatus(voterName, activePlayers) {
+    renderOnlineStoryVoteArea(activePlayers);
+}
+
+function registerOnlineStoryVoteClient(voterId, targetId) {
+    // Les clients reçoivent la mise à jour via STORY_VOTE_TICK
 }
 
 function tallyCadavreVotes() {
     const counts = {};
     const activePlayers = getActivePlayers();
-    
     activePlayers.forEach(p => counts[p.id] = 0);
     
     gameState.cadavreVotes.forEach(v => {
@@ -1143,7 +2381,6 @@ function tallyCadavreVotes() {
         }
     });
     
-    // Trouver le vainqueur
     let max = -1;
     let winners = [];
     for (let id in counts) {
@@ -1155,32 +2392,33 @@ function tallyCadavreVotes() {
         }
     }
     
-    // Attribuer les points (+200 pts), si égalité on partage
     winners.forEach(winnerId => {
         const winnerObj = gameState.players.find(p => p.id === winnerId);
         winnerObj.score += 200;
-        alert(`🏆 Plume d'Or : ${winnerObj.name} remporte le vote de l'histoire (+200 pts) !`);
+        alert(`🏆 Plume d'Or : ${winnerObj.name} remporte l'histoire (+200 pts) !`);
     });
     
-    // Passer au podium final
-    showFinalPodium();
+    if (gameState.mode === 'LOCAL') {
+        showFinalPodium();
+    } else {
+        // Fin en ligne
+        sendToAll({
+            type: 'GAME_OVER',
+            podium: gameState.players
+        });
+        showFinalPodium();
+    }
 }
 
-// --- Écran Podium & Fin de Partie ---
+// --- Écran Podium final ---
 
 function showFinalPodium() {
     showScreen('podium');
     
-    // Trier tous les joueurs (actifs et maudits)
     const sorted = [...gameState.players].sort((a, b) => b.score - a.score);
     
-    const podiumNames = ['podium-1', 'podium-2', 'podium-3'];
-    const emojis = ['👑', '🥈', '🥉'];
-    
-    // Réinitialiser l'affichage
     document.querySelectorAll('.podium-col').forEach(col => col.style.display = 'none');
     
-    // Remplir le podium
     // 1er
     if (sorted[0]) {
         document.getElementById('podium-1-name').textContent = sorted[0].name;
@@ -1200,7 +2438,6 @@ function showFinalPodium() {
         document.querySelector('.third-place').style.display = 'flex';
     }
     
-    // Remplir les détails
     const detailsList = document.getElementById('final-scoreboard-list');
     detailsList.innerHTML = "";
     sorted.forEach((p, idx) => {
@@ -1216,14 +2453,24 @@ function showFinalPodium() {
         detailsList.appendChild(row);
     });
     
-    // Lancer les confettis du podium
     if (stopConfettiFn) stopConfettiFn();
     stopConfettiFn = startConfetti('podium-confetti-canvas');
-}
-
-function endGameDirectly() {
-    clearInterval(timerInterval);
-    showFinalPodium();
+    
+    // Le bouton recommencer
+    const btnReset = document.querySelector('#screen-podium .btn-glow');
+    if (gameState.mode === 'ONLINE') {
+        // Seul l'hôte peut relancer
+        btnReset.style.display = gameState.isHost ? 'inline-flex' : 'none';
+        btnReset.textContent = "Retourner au Lobby Réseau";
+        btnReset.onclick = () => {
+            sendToAll({ type: 'KICK', reason: "La partie est terminée." });
+            resetGame();
+        };
+    } else {
+        btnReset.style.display = 'inline-flex';
+        btnReset.textContent = "Recommencer une partie";
+        btnReset.onclick = resetGame;
+    }
 }
 
 function resetGame() {
@@ -1232,20 +2479,35 @@ function resetGame() {
         stopConfettiFn = null;
     }
     
-    // Revenir au lobby
+    clearInterval(timerInterval);
+    cleanupNetwork();
+    
     document.getElementById('global-header').classList.add('hidden');
     currentStoryVoterIdx = 0;
+    
+    // Reset views
+    document.getElementById('online-host-setup').classList.remove('hidden');
+    document.getElementById('online-client-setup').classList.add('hidden');
+    document.getElementById('online-lobby-room').classList.add('hidden');
+    
+    // Restaurer champs inputs
+    document.getElementById('saisie-input').disabled = false;
+    document.getElementById('cadavre-textarea').disabled = false;
+    
+    // Réinitialiser les tabs dans l'UI
+    selectLobbyMode(gameState.mode);
+    
     showScreen('lobby');
 }
 
-// --- Fonctions Utilitaires ---
+// ==========================================================================
+// 🛠️ OUTILS ET UTILITAIRES
+// ==========================================================================
 
 function showScreen(screenId) {
-    // Cacher tous les écrans
     for (let key in screens) {
         screens[key].classList.remove('active');
     }
-    // Afficher l'écran demandé
     screens[screenId].classList.add('active');
 }
 
@@ -1260,6 +2522,49 @@ function updateGlobalHeader() {
     document.getElementById('info-phase').textContent = phaseName;
 }
 
+function getActivePlayers() {
+    return gameState.players.filter(p => p.active);
+}
+
+function checkActivePlayersCount() {
+    const activeCount = getActivePlayers().length;
+    if (activeCount < 2) {
+        clearInterval(timerInterval);
+        alert("⚠️ Il y a moins de 2 joueurs actifs. Fin de la partie !");
+        
+        if (gameState.mode === 'ONLINE' && gameState.isHost) {
+            sendToAll({
+                type: 'GAME_OVER',
+                podium: gameState.players
+            });
+        }
+        showFinalPodium();
+        return false;
+    }
+    return true;
+}
+
+let selectedVotePlayerId = null;
+
+function selectVoteCard(card) {
+    document.querySelectorAll('.vote-card').forEach(c => c.classList.remove('selected'));
+    card.classList.add('selected');
+    selectedVotePlayerId = parseInt(card.dataset.playerId);
+    document.getElementById('btn-submit-vote').disabled = false;
+}
+
+function generateLetters() {
+    let letters = [];
+    const vowelCount = 2 + Math.floor(Math.random() * 2);
+    for (let i = 0; i < vowelCount; i++) {
+        letters.push(VOWELS[Math.floor(Math.random() * VOWELS.length)]);
+    }
+    while (letters.length < 7) {
+        letters.push(CONSONANTS[Math.floor(Math.random() * CONSONANTS.length)]);
+    }
+    return letters.sort(() => Math.random() - 0.5);
+}
+
 // --- Confetti Canvas Engine (100% Autonome) ---
 
 function startConfetti(canvasId) {
@@ -1267,7 +2572,6 @@ function startConfetti(canvasId) {
     if (!canvas) return null;
     const ctx = canvas.getContext('2d');
     
-    // Redimensionner le canvas au parent
     canvas.width = canvas.parentElement.offsetWidth;
     canvas.height = canvas.parentElement.offsetHeight;
     
