@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Néologix - Le Jeu des Nouveaux Mots</title>
+    <!-- Google Fonts: Space Grotesk (Titres) et Outfit (Texte) -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="particles-js"></div> <!-- Arrière-plan dynamique optionnel -->
+    
+    <div class="app-container">
+        <!-- HEADER GLOBAL (Masqué sur certains écrans de transition/fin) -->
+        <header id="global-header" class="hidden">
+            <div class="logo">NÉOLOGIX</div>
+            <div class="game-info">
+                <span id="info-round">Manche 1/3</span>
+                <span class="separator">•</span>
+                <span id="info-phase">Phase 1 : Le Mot</span>
+            </div>
+        </header>
+
+        <main id="screen-container">
+            <!-- 1. ÉCRAN LOBBY -->
+            <section id="screen-lobby" class="screen active">
+                <div class="hero-section">
+                    <h1 class="game-title">NÉOLOGIX</h1>
+                    <p class="game-subtitle">Créez des mots. Inventez des sens. Semez le chaos.</p>
+                </div>
+                
+                <div class="glass-panel lobby-panel">
+                    <h2>Configuration de la partie</h2>
+                    
+                    <div class="setup-group">
+                        <label for="round-count">Nombre de manches (mots à créer) :</label>
+                        <div class="number-selector">
+                            <button type="button" class="btn-minus" onclick="adjustRounds(-1)">-</button>
+                            <input type="number" id="round-count" value="2" min="1" max="5" readonly>
+                            <button type="button" class="btn-plus" onclick="adjustRounds(1)">+</button>
+                        </div>
+                    </div>
+
+                    <div class="setup-group">
+                        <label>Options du Chronomètre :</label>
+                        <div class="toggle-container">
+                            <label class="switch">
+                                <input type="checkbox" id="timer-toggle" checked onchange="toggleTimerSettings()">
+                                <span class="slider round"></span>
+                            </label>
+                            <span id="timer-status-text">Actif (Règles officielles)</span>
+                        </div>
+                    </div>
+
+                    <div class="setup-group">
+                        <label>Joueurs (2 à 4) :</label>
+                        <div id="players-list-input">
+                            <div class="player-input-row">
+                                <span class="player-num">J1</span>
+                                <input type="text" class="player-name-input" placeholder="Pseudo Joueur 1" value="Bison">
+                            </div>
+                            <div class="player-input-row">
+                                <span class="player-num">J2</span>
+                                <input type="text" class="player-name-input" placeholder="Pseudo Joueur 2" value="Alphonsine">
+                            </div>
+                        </div>
+                        <button type="button" id="btn-add-player" class="btn btn-secondary btn-sm" onclick="addPlayerField()">+ Ajouter un joueur</button>
+                    </div>
+
+                    <button type="button" class="btn btn-primary btn-large" onclick="startGame()">Lancer la partie</button>
+                </div>
+            </section>
+
+            <!-- 2. ÉCRAN DE TRANSITION (PASS & PLAY) -->
+            <section id="screen-transition" class="screen">
+                <div class="glass-panel transition-panel text-center">
+                    <div class="avatar-pulse" id="transition-avatar">?</div>
+                    <h2 id="transition-title">C'est au tour de...</h2>
+                    <p id="transition-instruction" class="highlight-text">Prépare-toi à saisir ta proposition.</p>
+                    <div class="warning-box">
+                        <p>⚠️ Les autres joueurs doivent détourner le regard !</p>
+                    </div>
+                    <button type="button" class="btn btn-primary btn-large" onclick="proceedToSaisie()">Je suis prêt, afficher l'écran</button>
+                </div>
+            </section>
+
+            <!-- 3. ÉCRAN DE SAISIE (MOT / DEFINITION / PHRASE) -->
+            <section id="screen-saisie" class="screen">
+                <div class="progress-bar-container">
+                    <div id="saisie-progress" class="progress-bar"></div>
+                </div>
+
+                <div class="saisie-header">
+                    <div class="saisie-prompt-box text-center">
+                        <h2 id="saisie-prompt-title">Invente ton mot !</h2>
+                        <div id="saisie-context-area">
+                            <!-- Lettres de Scrabble ou indices s'afficheront ici -->
+                        </div>
+                    </div>
+
+                    <div class="timer-wrapper">
+                        <div id="timer-circle-svg">
+                            <svg viewBox="0 0 100 100">
+                                <circle cx="50" cy="50" r="45" class="timer-bg"></circle>
+                                <circle cx="50" cy="50" r="45" class="timer-progress" id="timer-bar"></circle>
+                            </svg>
+                            <div id="timer-text">30</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="glass-panel saisie-panel">
+                    <div class="input-wrapper">
+                        <input type="text" id="saisie-input" autocomplete="off" placeholder="Tapes ton imagination ici..." onkeydown="handleSaisieKeydown(event)">
+                        <label for="saisie-input" id="saisie-input-label">Néologisme</label>
+                    </div>
+                    <div class="saisie-helper" id="saisie-helper-text">
+                        Utilise les lettres ci-dessus.
+                    </div>
+                    <button type="button" id="btn-submit-saisie" class="btn btn-primary btn-large" onclick="submitSaisie()">Valider ma proposition</button>
+                </div>
+            </section>
+
+            <!-- 4. ÉCRAN DE TRANSITION POUR LE VOTE -->
+            <section id="screen-vote-transition" class="screen">
+                <div class="glass-panel transition-panel text-center">
+                    <div class="avatar-pulse" id="vote-transition-avatar">🗳️</div>
+                    <h2 id="vote-transition-title">Phase de Vote Secret</h2>
+                    <p id="vote-transition-instruction" class="highlight-text">C'est au tour de [Joueur] de voter.</p>
+                    <div class="warning-box">
+                        <p>⚠️ Les autres joueurs doivent détourner le regard ! Chacun vote à son tour.</p>
+                    </div>
+                    <button type="button" class="btn btn-primary btn-large" onclick="proceedToVote()">Je suis prêt à voter</button>
+                </div>
+            </section>
+
+            <!-- 5. ÉCRAN DE VOTE -->
+            <section id="screen-vote" class="screen">
+                <div class="vote-header text-center">
+                    <h2 id="vote-prompt-title">Vote pour la meilleure proposition !</h2>
+                    <p id="vote-voter-name" class="voter-badge">Votant : [Joueur]</p>
+                </div>
+
+                <div class="vote-options-container" id="vote-cards-area">
+                    <!-- Les cartes d'options de vote seront injectées ici -->
+                </div>
+
+                <div class="glass-panel vote-actions text-center">
+                    <p class="info-text">Clique sur une carte pour la sélectionner. Tu ne peux pas voter pour ta propre proposition (elle est grisée).</p>
+                    <button type="button" id="btn-submit-vote" class="btn btn-primary btn-large" disabled onclick="submitVote()">Confirmer mon vote</button>
+                </div>
+            </section>
+
+            <!-- 6. ÉCRAN RÉVÉLATION & POINTS -->
+            <section id="screen-reveal" class="screen">
+                <canvas id="confetti-canvas"></canvas>
+                
+                <div class="reveal-container">
+                    <div class="reveal-card-glow">
+                        <div class="glass-panel reveal-main-panel text-center">
+                            <div class="crown-icon">👑</div>
+                            <h2 class="section-title">Proposition Gagnante !</h2>
+                            <div id="reveal-winner-display" class="winner-display-box">
+                                <span id="reveal-winning-text">MONMOT</span>
+                            </div>
+                            <div id="reveal-winner-meta" class="winner-meta-box">
+                                Inventé par <span id="reveal-winner-author" class="highlight-name">Joueur 1</span>
+                                <div class="points-badge">+<span id="reveal-points-added">50</span> pts</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="glass-panel scoreboard-panel">
+                        <h3>Classement Actuel</h3>
+                        <div id="scoreboard-list">
+                            <!-- Tableau des scores dynamique -->
+                        </div>
+                        <button type="button" class="btn btn-primary btn-large" onclick="nextStepAfterReveal()">Continuer la partie</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 7. ÉCRAN CADAVRE EXQUIS (SAISIE NARRATIVE) -->
+            <section id="screen-cadavre-exquis" class="screen">
+                <div class="progress-bar-container">
+                    <div id="cadavre-progress" class="progress-bar"></div>
+                </div>
+
+                <div class="cadavre-header text-center">
+                    <h2>Le Cadavre Exquis Final</h2>
+                    <p class="highlight-text">Chaque joueur va écrire une partie de l'histoire.</p>
+                </div>
+
+                <div class="cadavre-container">
+                    <div class="glass-panel cadavre-helper-panel">
+                        <h3>Mots inventés à utiliser :</h3>
+                        <p class="instruction-text">Tu dois utiliser au moins un des mots gagnants ci-dessous. Clique sur un mot pour l'insérer.</p>
+                        <div id="cadavre-words-list" class="words-rack">
+                            <!-- Mots gagnants à cliquer -->
+                        </div>
+                    </div>
+
+                    <div class="glass-panel cadavre-input-panel">
+                        <div class="history-peek-box" id="cadavre-peek-box">
+                            <span class="peek-label">Fin de la phrase précédente :</span>
+                            <blockquote id="cadavre-peek-text">"... et c'est ainsi que tout a commencé."</blockquote>
+                        </div>
+
+                        <div class="input-wrapper">
+                            <textarea id="cadavre-textarea" rows="3" placeholder="Écris la suite de l'histoire ici..." oninput="validateCadavreInput()"></textarea>
+                            <label for="cadavre-textarea">Ta contribution</label>
+                        </div>
+                        <div class="helper-note" id="cadavre-validation-msg">
+                            ❌ Ton texte doit inclure l'un des mots de la liste.
+                        </div>
+                        
+                        <div class="saisie-footer flex-between">
+                            <div id="cadavre-timer" class="timer-text-inline">⏳ Temps restant : <span id="cadavre-timer-value">90</span>s</div>
+                            <button type="button" id="btn-submit-cadavre" class="btn btn-primary" disabled onclick="submitCadavreSentence()">Valider ma phrase</button>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 8. ÉCRAN RÉVÉLATION HISTOIRE ET VOTE CADAVRE -->
+            <section id="screen-cadavre-reveal" class="screen">
+                <div class="reveal-story-container">
+                    <div class="glass-panel story-panel">
+                        <h2 class="text-center">L'Histoire Finale</h2>
+                        <div id="story-full-text" class="story-content">
+                            <!-- L'histoire sera injectée ici mot par mot ou phrase par phrase -->
+                        </div>
+                    </div>
+
+                    <div class="glass-panel vote-story-panel text-center">
+                        <h2>Élection du meilleur narrateur</h2>
+                        <p>Les plumes se délient ! Qui a écrit le passage le plus loufoque ou le plus brillant ?</p>
+                        
+                        <div id="story-vote-players-area">
+                            <!-- Boutons de vote pour les joueurs du cadavre exquis -->
+                        </div>
+                        
+                        <div class="vote-status-text" id="story-vote-status-text">
+                            En attente des votes...
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- 9. ÉCRAN PODIUM FINAL -->
+            <section id="screen-podium" class="screen">
+                <canvas id="podium-confetti-canvas"></canvas>
+                <div class="podium-container text-center">
+                    <h1 class="glow-title">FIN DE LA PARTIE</h1>
+                    <p class="subtitle">Voici les légendes de Néologix</p>
+
+                    <div class="podium-visuals">
+                        <!-- 2ème Place -->
+                        <div class="podium-col second-place">
+                            <div class="podium-character" id="podium-2-avatar">🥈</div>
+                            <div class="podium-name" id="podium-2-name">Joueur 2</div>
+                            <div class="podium-score" id="podium-2-score">150 pts</div>
+                            <div class="podium-bar">2</div>
+                        </div>
+
+                        <!-- 1ère Place -->
+                        <div class="podium-col first-place">
+                            <div class="podium-character" id="podium-1-avatar">👑</div>
+                            <div class="podium-name" id="podium-1-name">Joueur 1</div>
+                            <div class="podium-score" id="podium-1-score">350 pts</div>
+                            <div class="podium-bar">1</div>
+                        </div>
+
+                        <!-- 3ème Place -->
+                        <div class="podium-col third-place">
+                            <div class="podium-character" id="podium-3-avatar">🥉</div>
+                            <div class="podium-name" id="podium-3-name">Joueur 3</div>
+                            <div class="podium-score" id="podium-3-score">100 pts</div>
+                            <div class="podium-bar">3</div>
+                        </div>
+                    </div>
+
+                    <div class="glass-panel details-panel">
+                        <h3>Détails des Scores</h3>
+                        <div id="final-scoreboard-list">
+                            <!-- Liste complète des scores, y compris les joueurs éliminés/maudits -->
+                        </div>
+                    </div>
+
+                    <button type="button" class="btn btn-primary btn-large btn-glow" onclick="resetGame()">Recommencer une partie</button>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Script de logique de jeu -->
+    <script src="app.js"></script>
+</body>
+</html>
