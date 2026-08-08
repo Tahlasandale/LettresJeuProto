@@ -22,7 +22,7 @@ let gameState = {
     currentRound: 1,         // Manche en cours (1 à roundCount)
     currentPhase: 1,         // Phase en cours (1 = Mot, 2 = Définition, 3 = Phrase)
     timerEnabled: true,      // Active/Désactive la limite de temps
-    phase3Enabled: true,     // Active/Désactive la Phase 3 (Phrase d'exemple)
+    phase3Enabled: false,    // Active/Désactive la Phase 3 (Phrase d'exemple)
     gamePhase: 'LOBBY',      // 'LOBBY'|'INPUT'|'VOTE'|'REVEAL'|'CADAVRE'|'STORY_VOTE'|'PODIUM'
     
     // Données par manche
@@ -1364,7 +1364,11 @@ function startOnlineTimer(duration) {
         
         if (timerSecondsRemaining <= 0) {
             clearInterval(timerInterval);
-            handleOnlineAFKTimeout();
+            if (gameState.gamePhase === 'INPUT') {
+                handleOnlineAFKTimeout();
+            } else if (gameState.gamePhase === 'VOTE') {
+                handleOnlineVoteAFKTimeout();
+            }
         }
     }, 1000);
 }
@@ -1411,6 +1415,40 @@ function handleOnlineAFKTimeout() {
         
         if (checkActivePlayersCount()) {
             initVotePhase();
+        }
+    }, 1500);
+}
+
+function handleOnlineVoteAFKTimeout() {
+    if (gameState.gamePhase !== 'VOTE') return;
+    
+    // Attendre 1.5s de grâce pour tolérer la latence réseau
+    setTimeout(() => {
+        if (gameState.gamePhase !== 'VOTE') return;
+        
+        const activePlayers = getActivePlayers();
+        
+        // Traiter chaque joueur actif qui n'a pas voté
+        activePlayers.forEach((player) => {
+            const hasVoted = gameState.votes.some(v => v.voterId === player.id);
+            if (!hasVoted) {
+                player.active = false;
+                if (player.id !== 0) {
+                    const conn = connections.get(player.id);
+                    if (conn) {
+                        conn.send({ type: 'KICK', reason: "Temps écoulé pour le vote (AFK)." });
+                        conn.close();
+                    }
+                } else {
+                    alert("💀 Vous avez été éliminé pour inactivité (Vote manqué) !");
+                }
+            }
+        });
+        
+        broadcastState();
+        
+        if (checkActivePlayersCount()) {
+            checkAllVotesSubmitted();
         }
     }, 1500);
 }
@@ -1626,6 +1664,9 @@ function initVotePhase() {
             document.getElementById('vote-cards-area').innerHTML = "<div class='info-text'>Les autres joueurs sont en train de voter...</div>";
             document.getElementById('btn-submit-vote').disabled = true;
         }
+        
+        // Démarrer le chronomètre officiel de vote de 1 minute
+        startOnlineTimer(60);
     }
 }
 
@@ -1769,6 +1810,8 @@ function setupClientVoteUI() {
     
     document.getElementById('btn-submit-vote').disabled = true;
     document.getElementById('btn-submit-vote').onclick = submitClientVote;
+    
+    startClientTimer(60);
 }
 
 function submitClientVote() {
@@ -2584,8 +2627,8 @@ function renderLocalStoryVoteButtons() {
         return;
     }
     
-    // Démarrer le timer de 30 secondes pour le vote de la plume d'or local
-    startStoryVoteTimer(30);
+    // Démarrer le timer de 60 secondes pour le vote de la plume d'or local
+    startStoryVoteTimer(60);
     
     const currentVoter = activePlayers[currentStoryVoterIdx];
     statusText.textContent = `Au tour de ${currentVoter.name} de voter...`;
@@ -2645,7 +2688,7 @@ function initOnlineCadavreReveal() {
     renderOnlineStoryVoteArea(activePlayers);
     
     // Démarrer le timer de la plume d'or pour l'Hôte
-    startStoryVoteTimer(30);
+    startStoryVoteTimer(60);
 }
 
 function renderOnlineStoryText(sentences, definitionsMap) {
@@ -2735,7 +2778,7 @@ function registerOnlineStoryVote(voterId, targetId) {
         renderOnlineStoryVoteArea(activePlayers);
         
         // Relancer le timer pour le votant suivant
-        startStoryVoteTimer(30);
+        startStoryVoteTimer(60);
     }
 }
 
@@ -3299,7 +3342,7 @@ function resumeHostGameScreen() {
         }
         renderOnlineStoryText(gameState.cadavreSentences, definitionsMap);
         renderOnlineStoryVoteArea(getActivePlayers());
-        startStoryVoteTimer(30);
+        startStoryVoteTimer(60);
     } else if (gameState.gamePhase === 'PODIUM') {
         showScreen('podium');
         showFinalPodium();

@@ -1,5 +1,7 @@
 # 👑 NÉOLOGIX — Le Jeu des Mots Inventés
 
+![NÉOLOGIX Logo](logo-full.png)
+
 **Néologix** est un jeu de société numérique rapide, créatif et drôle (Party Game) basé sur la création de néologismes. 
 
 À partir d'un même tirage aléatoire de 7 lettres de Scrabble, les joueurs doivent inventer un mot, lui trouver une définition, l'utiliser dans une phrase d'exemple, puis fusionner leurs créations dans un cadavre exquis littéraire. L'humour, la mauvaise foi et la créativité sont au cœur de l'expérience, départagés par des votes anonymes.

@@ -4,12 +4,27 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Néologix - Le Jeu des Nouveaux Mots</title>
+    <!-- Favicon & PWA Tags -->
+    <link rel="icon" type="image/png" href="favicon.png">
+    <link rel="apple-touch-icon" href="favicon.png">
+    <link rel="manifest" href="manifest.json">
+    <meta name="theme-color" content="#00f0ff">
+    
     <!-- Google Fonts: Fredoka (Titres) et Outfit (Texte) -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css">
     <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <script>
+        if ('serviceWorker' in navigator) {
+            window.addEventListener('load', () => {
+                navigator.serviceWorker.register('./sw.js')
+                    .then(reg => console.log('Service Worker enregistré avec succès !', reg))
+                    .catch(err => console.log('Erreur d\'enregistrement du Service Worker :', err));
+            });
+        }
+    </script>
 </head>
 <body>
     <div id="particles-js"></div> <!-- Arrière-plan dynamique optionnel -->
@@ -67,10 +82,10 @@
                             <label>Phase 3 (Phrase d'exemple) :</label>
                             <div class="toggle-container">
                                 <label class="switch">
-                                    <input type="checkbox" id="phase3-toggle" checked onchange="updatePhase3Text()">
+                                    <input type="checkbox" id="phase3-toggle" onchange="updatePhase3Text()">
                                     <span class="slider round"></span>
                                 </label>
-                                <span id="phase3-status-text" style="color: var(--color-primary);">Activée</span>
+                                <span id="phase3-status-text" style="color: var(--text-muted);">Désactivée</span>
                             </div>
                         </div>
 
@@ -79,11 +94,11 @@
                             <div id="players-list-input">
                                 <div class="player-input-row">
                                     <span class="player-num">J1</span>
-                                    <input type="text" class="player-name-input" placeholder="Pseudo Joueur 1" value="Bison">
+                                    <input type="text" class="player-name-input" placeholder="Pseudo Joueur 1" value="Joueur 1">
                                 </div>
                                 <div class="player-input-row">
                                     <span class="player-num">J2</span>
-                                    <input type="text" class="player-name-input" placeholder="Pseudo Joueur 2" value="Alphonsine">
+                                    <input type="text" class="player-name-input" placeholder="Pseudo Joueur 2" value="Joueur 2">
                                 </div>
                             </div>
                             <button type="button" id="btn-add-player" class="btn btn-secondary btn-sm" onclick="addPlayerField()">+ Ajouter un joueur</button>
@@ -105,7 +120,7 @@
                             <div class="setup-group">
                                 <label for="online-host-name">Pseudo de l'Hôte :</label>
                                 <div class="input-wrapper">
-                                    <input type="text" id="online-host-name" value="Bison" placeholder="Pseudo de l'Hôte...">
+                                    <input type="text" id="online-host-name" value="Joueur 1" placeholder="Pseudo de l'Hôte...">
                                     <label for="online-host-name">Mon Pseudo</label>
                                 </div>
                             </div>
@@ -134,10 +149,10 @@
                                 <label>Phase 3 (Phrase d'exemple) :</label>
                                 <div class="toggle-container">
                                     <label class="switch">
-                                        <input type="checkbox" id="online-phase3-toggle" checked onchange="updateOnlinePhase3Text()">
+                                        <input type="checkbox" id="online-phase3-toggle" onchange="updateOnlinePhase3Text()">
                                         <span class="slider round"></span>
                                     </label>
-                                    <span id="online-phase3-status-text" style="color: var(--color-primary);">Activée</span>
+                                    <span id="online-phase3-status-text" style="color: var(--text-muted);">Désactivée</span>
                                 </div>
                             </div>
 
@@ -150,7 +165,7 @@
                             <div class="setup-group">
                                 <label for="online-client-name">Ton Pseudo :</label>
                                 <div class="input-wrapper">
-                                    <input type="text" id="online-client-name" value="Alphonsine" placeholder="Ton pseudo...">
+                                    <input type="text" id="online-client-name" value="Joueur 2" placeholder="Ton pseudo...">
                                     <label for="online-client-name">Pseudo</label>
                                 </div>
                             </div>
