@@ -22,6 +22,7 @@ let gameState = {
     currentRound: 1,         // Manche en cours (1 à roundCount)
     currentPhase: 1,         // Phase en cours (1 = Mot, 2 = Définition, 3 = Phrase)
     timerEnabled: true,      // Active/Désactive la limite de temps
+    phase3Enabled: true,     // Active/Désactive la Phase 3 (Phrase d'exemple)
     gamePhase: 'LOBBY',      // 'LOBBY'|'INPUT'|'VOTE'|'REVEAL'|'CADAVRE'|'STORY_VOTE'|'PODIUM'
     
     // Données par manche
@@ -75,6 +76,41 @@ const screens = {
 // --- Initialisation ---
 document.addEventListener('DOMContentLoaded', () => {
     toggleTimerSettings(); // Initialise l'affichage du timer local
+    updatePhase3Text(); // Initialise l'affichage de la phase 3 locale
+    updateOnlinePhase3Text(); // Initialise l'affichage de la phase 3 en ligne
+    
+    // Charger le pseudo depuis localStorage
+    const savedPseudo = localStorage.getItem('neologix_pseudo');
+    if (savedPseudo) {
+        syncPseudoInput(savedPseudo);
+    }
+    
+    // Ajouter les listeners de synchronisation
+    const hostInput = document.getElementById('online-host-name');
+    const clientInput = document.getElementById('online-client-name');
+    const localInputs = document.querySelectorAll('.player-name-input');
+    
+    if (hostInput) {
+        hostInput.addEventListener('input', (e) => syncPseudoInput(e.target.value));
+    }
+    if (clientInput) {
+        clientInput.addEventListener('input', (e) => syncPseudoInput(e.target.value));
+    }
+    if (localInputs.length > 0) {
+        localInputs[0].addEventListener('input', (e) => syncPseudoInput(e.target.value));
+    }
+    
+    // Restaurer la session si existante
+    const savedSessionStr = sessionStorage.getItem('neologix_online_session');
+    if (savedSessionStr) {
+        try {
+            const session = JSON.parse(savedSessionStr);
+            restoreOnlineSession(session);
+        } catch (e) {
+            console.error("Erreur de restauration de session :", e);
+            sessionStorage.removeItem('neologix_online_session');
+        }
+    }
 });
 
 // --- Gestion des Onglets du Lobby ---
@@ -299,25 +335,69 @@ function handleIncomingConnection(conn) {
 }
 
 function registerNewPlayer(conn, name) {
+    const finalName = name.trim();
+    
+    // Vérifier s'il s'agit d'une reconnexion (nom identique)
+    const existingPlayer = gameState.players.find(p => p.name.toLowerCase() === finalName.toLowerCase());
+    
+    if (existingPlayer) {
+        // Reconnexion d'un joueur existant
+        existingPlayer.active = true;
+        conn.metadata = { playerId: existingPlayer.id, playerName: existingPlayer.name };
+        connections.set(existingPlayer.id, conn);
+        
+        // Renvoyer WELCOME
+        conn.send({
+            type: 'WELCOME',
+            playerId: existingPlayer.id,
+            players: gameState.players,
+            code: peer.id.toUpperCase(),
+            roundCount: gameState.roundCount,
+            timerEnabled: gameState.timerEnabled,
+            phase3Enabled: gameState.phase3Enabled
+        });
+        
+        if (gameState.gamePhase !== 'LOBBY') {
+            const activePlayers = getActivePlayers();
+            conn.send({
+                type: 'SYNC_GAME',
+                gamePhase: gameState.gamePhase,
+                currentRound: gameState.currentRound,
+                currentPhase: gameState.currentPhase,
+                roundData: gameState.roundData,
+                propositions: gameState.propositions,
+                voteOptions: gameState.voteOptions,
+                winningWordsList: gameState.winningWordsList,
+                cadavreSentences: gameState.cadavreSentences,
+                activeCadavreIndex: gameState.activeCadavreIndex,
+                writerName: activePlayers[gameState.activeCadavreIndex] ? activePlayers[gameState.activeCadavreIndex].name : ""
+            });
+        }
+        
+        broadcastState();
+        updateOnlinePlayersDisplay();
+        return;
+    }
+    
     if (gameState.players.length >= 4) {
         conn.send({ type: 'KICK', reason: 'Le salon est complet (max 4 joueurs).' });
         conn.close();
         return;
     }
     
-    // Pseudo unique
-    let finalName = name.trim();
-    if (gameState.players.some(p => p.name.toLowerCase() === finalName.toLowerCase())) {
-        finalName += `_${gameState.players.length}`;
+    // Pseudo unique si nouveau joueur
+    let uniqueName = finalName;
+    if (gameState.players.some(p => p.name.toLowerCase() === uniqueName.toLowerCase())) {
+        uniqueName += `_${gameState.players.length}`;
     }
     
     const newId = gameState.players.length;
-    conn.metadata = { playerId: newId, playerName: finalName }; // Rattacher l'ID à la connexion
+    conn.metadata = { playerId: newId, playerName: uniqueName }; // Rattacher l'ID à la connexion
     connections.set(newId, conn);
     
     gameState.players.push({
         id: newId,
-        name: finalName,
+        name: uniqueName,
         score: 0,
         active: true
     });
@@ -329,7 +409,8 @@ function registerNewPlayer(conn, name) {
         players: gameState.players,
         code: peer.id.toUpperCase(),
         roundCount: gameState.roundCount,
-        timerEnabled: gameState.timerEnabled
+        timerEnabled: gameState.timerEnabled,
+        phase3Enabled: gameState.phase3Enabled
     });
     
     // Mettre à jour tout le monde
@@ -342,6 +423,7 @@ function broadcastState() {
         type: 'LOBBY_UPDATE',
         players: gameState.players
     });
+    if (typeof saveSession === 'function') saveSession();
 }
 
 function sendToAll(data) {
@@ -350,6 +432,7 @@ function sendToAll(data) {
             conn.send(data);
         }
     });
+    if (typeof saveSession === 'function') saveSession();
 }
 
 function updateOnlinePlayersDisplay() {
@@ -398,30 +481,12 @@ function joinOnlineGame() {
     peer = new Peer(); // ID aléatoire pour le client
     
     peer.on('open', () => {
-        myConnection = peer.connect(hostId);
-        
-        myConnection.on('open', () => {
-            document.getElementById('online-lobby-status-msg').textContent = "Connexion établie, enregistrement pseudo...";
-            myConnection.send({
-                type: 'JOIN',
-                name: clientName
-            });
-        });
-        
-        myConnection.on('data', (data) => {
-            handleClientIncomingMessage(data);
-        });
-        
-        myConnection.on('close', () => {
-            alert("⚠️ Liaison coupée avec l'Hôte. Retour au Lobby.");
-            resetGame();
-        });
+        attemptClientReconnection(hostId);
     });
     
     peer.on('error', (err) => {
         console.error(err);
-        alert("Impossible de rejoindre ce salon. Vérifiez le code.");
-        resetGame();
+        alert("Erreur de connexion. Veuillez vérifier le code.");
     });
 }
 
@@ -456,6 +521,7 @@ function handleClientIncomingMessage(data) {
             gameState.players = data.players;
             gameState.roundCount = data.roundCount;
             gameState.timerEnabled = data.timerEnabled;
+            gameState.phase3Enabled = data.phase3Enabled;
             document.getElementById('lobby-room-code').textContent = data.code;
             document.getElementById('online-lobby-status-msg').textContent = "En attente du lancement par l'Hôte...";
             updateOnlinePlayersDisplay();
@@ -472,6 +538,9 @@ function handleClientIncomingMessage(data) {
             break;
             
         case 'GAME_START':
+            gameState.roundCount = data.roundCount;
+            gameState.timerEnabled = data.timerEnabled;
+            gameState.phase3Enabled = data.phase3Enabled;
             // Lancement du jeu
             document.getElementById('global-header').classList.remove('hidden');
             showScreen('saisie'); // Sera configuré par PHASE_START immédiatement
@@ -572,6 +641,7 @@ function handleClientIncomingMessage(data) {
             renderScoreboard();
             break;
     }
+    if (typeof saveSession === 'function') saveSession();
 }
 
 // --- Gestion des Déconnexions en cours de partie ---
@@ -607,7 +677,8 @@ function handlePlayerDisconnect(playerId) {
                 players: gameState.players,
                 code: peer.id.toUpperCase(),
                 roundCount: gameState.roundCount,
-                timerEnabled: gameState.timerEnabled
+                timerEnabled: gameState.timerEnabled,
+                phase3Enabled: gameState.phase3Enabled
             });
         });
         
@@ -706,9 +777,15 @@ function startOnlineGame() {
     if (!gameState.isHost) return;
     
     gameState.mode = 'ONLINE';
+    gameState.phase3Enabled = document.getElementById('online-phase3-toggle').checked;
     
-    // Notifier tout le monde
-    sendToAll({ type: 'GAME_START' });
+    // Notifier tout le monde avec les réglages de la partie
+    sendToAll({
+        type: 'GAME_START',
+        roundCount: gameState.roundCount,
+        timerEnabled: gameState.timerEnabled,
+        phase3Enabled: gameState.phase3Enabled
+    });
     
     // Masquer le lobby et lancer la manche 1
     document.getElementById('global-header').classList.remove('hidden');
@@ -750,6 +827,7 @@ function startGame() {
     }
     
     gameState.players = players;
+    gameState.phase3Enabled = document.getElementById('phase3-toggle').checked;
     gameState.currentRound = 1;
     gameState.currentPhase = 1;
     gameState.roundData = {};
@@ -829,9 +907,8 @@ function setupOnlineHostSaisieUI(duration) {
     const helperText = document.getElementById('saisie-helper-text');
     const inputLabel = document.getElementById('saisie-input-label');
     const inputField = document.getElementById('saisie-input');
+    const btnSubmit = document.getElementById('btn-submit-saisie');
     
-    inputField.disabled = false;
-    inputField.value = "";
     document.getElementById('saisie-progress').style.width = "0%";
     
     if (phase === 1) {
@@ -868,10 +945,22 @@ function setupOnlineHostSaisieUI(duration) {
         `;
     }
     
-    document.getElementById('btn-submit-saisie').disabled = false;
-    document.getElementById('btn-submit-saisie').onclick = submitOnlineHostSaisie;
-    
-    setTimeout(() => inputField.focus(), 100);
+    // Gérer la reconnexion/actualisation si déjà soumis
+    const hasSubmitted = gameState.propositions.some(p => p.playerId === 0);
+    if (hasSubmitted) {
+        const myProp = gameState.propositions.find(p => p.playerId === 0);
+        inputField.value = myProp ? myProp.text : "";
+        inputField.disabled = true;
+        btnSubmit.disabled = true;
+        promptTitle.textContent = "Proposition validée !";
+        helperText.textContent = "En attente des autres joueurs...";
+    } else {
+        inputField.disabled = false;
+        inputField.value = "";
+        btnSubmit.disabled = false;
+        btnSubmit.onclick = submitOnlineHostSaisie;
+        setTimeout(() => inputField.focus(), 100);
+    }
     
     // Chronomètre unique géré par l'Hôte
     startOnlineTimer(duration);
@@ -886,9 +975,8 @@ function setupClientSaisieUI(duration) {
     const helperText = document.getElementById('saisie-helper-text');
     const inputLabel = document.getElementById('saisie-input-label');
     const inputField = document.getElementById('saisie-input');
+    const btnSubmit = document.getElementById('btn-submit-saisie');
     
-    inputField.disabled = false;
-    inputField.value = "";
     document.getElementById('saisie-progress').style.width = "0%";
     
     if (phase === 1) {
@@ -925,13 +1013,25 @@ function setupClientSaisieUI(duration) {
         `;
     }
     
-    document.getElementById('btn-submit-saisie').disabled = false;
-    document.getElementById('btn-submit-saisie').onclick = submitClientSaisie;
+    // Gérer la reconnexion/actualisation si déjà soumis
+    const hasSubmitted = gameState.propositions.some(p => p.playerId === gameState.myPlayerId);
+    if (hasSubmitted) {
+        const myProp = gameState.propositions.find(p => p.playerId === gameState.myPlayerId);
+        inputField.value = myProp ? myProp.text : "";
+        inputField.disabled = true;
+        btnSubmit.disabled = true;
+        promptTitle.textContent = "Proposition envoyée !";
+        helperText.textContent = "En attente de l'Hôte...";
+    } else {
+        inputField.disabled = false;
+        inputField.value = "";
+        btnSubmit.disabled = false;
+        btnSubmit.onclick = submitClientSaisie;
+        setTimeout(() => inputField.focus(), 100);
+    }
     
     // Le client démarre un timer fictif qui sera synchronisé par l'Hôte
     startClientTimer(duration);
-    
-    setTimeout(() => inputField.focus(), 100);
 }
 
 // --- Soumissions en Ligne ---
@@ -1560,6 +1660,15 @@ function setupOnlineHostVoteUI() {
     voterName.textContent = `Votant : Hôte`;
     container.innerHTML = "";
     
+    // Gérer la reconnexion si déjà voté
+    const hasVoted = gameState.votes.some(v => v.voterId === 0);
+    if (hasVoted) {
+        voteTitle.textContent = "Vote pris en compte !";
+        container.innerHTML = "<div class='info-text'>En attente du vote des autres...</div>";
+        document.getElementById('btn-submit-vote').disabled = true;
+        return;
+    }
+    
     if (gameState.isMortSubite) {
         voteTitle.innerHTML = `⚡ MORT SUBITE ⚡ Égalité ! Vote pour départager :`;
     } else {
@@ -1625,6 +1734,15 @@ function setupClientVoteUI() {
     
     voterName.textContent = `Votant : Toi`;
     container.innerHTML = "";
+    
+    // Gérer la reconnexion si déjà voté
+    const hasVoted = gameState.votes.some(v => v.voterId === gameState.myPlayerId);
+    if (hasVoted) {
+        voteTitle.textContent = "Vote transmis !";
+        container.innerHTML = "<div class='info-text'>En attente de l'Hôte...</div>";
+        document.getElementById('btn-submit-vote').disabled = true;
+        return;
+    }
     
     if (gameState.isMortSubite) {
         voteTitle.innerHTML = `⚡ MORT SUBITE ⚡ Égalité ! Vote pour départager :`;
@@ -1891,7 +2009,9 @@ function nextStepAfterReveal() {
         stopConfettiFn = null;
     }
     
-    if (gameState.currentPhase < 3) {
+    const maxPhase = gameState.phase3Enabled ? 3 : 2;
+    
+    if (gameState.currentPhase < maxPhase) {
         gameState.currentPhase++;
         initSaisiePhase();
     } else {
@@ -2876,16 +2996,22 @@ function getActivePlayers() {
 function checkActivePlayersCount() {
     const activeCount = getActivePlayers().length;
     if (activeCount < 2) {
-        clearInterval(timerInterval);
-        alert("⚠️ Il y a moins de 2 joueurs actifs. Fin de la partie !");
-        
-        if (gameState.mode === 'ONLINE' && gameState.isHost) {
-            sendToAll({
-                type: 'GAME_OVER',
-                podium: gameState.players
-            });
-        }
-        showFinalPodium();
+        // Laisser 5 secondes de grâce pour tolérer un rafraîchissement de page
+        setTimeout(() => {
+            const currentActiveCount = getActivePlayers().length;
+            if (currentActiveCount < 2) {
+                clearInterval(timerInterval);
+                alert("⚠️ Il y a moins de 2 joueurs actifs. Fin de la partie !");
+                
+                if (gameState.mode === 'ONLINE' && gameState.isHost) {
+                    sendToAll({
+                        type: 'GAME_OVER',
+                        podium: gameState.players
+                    });
+                }
+                showFinalPodium();
+            }
+        }, 5000);
         return false;
     }
     return true;
@@ -3019,4 +3145,237 @@ function handleSaisieKeydown(event) {
             btn.click();
         }
     }
+}
+
+// --- Nouvelles fonctions utilitaires ---
+
+function updatePhase3Text() {
+    const toggle = document.getElementById('phase3-toggle');
+    const status = document.getElementById('phase3-status-text');
+    if (toggle && status) {
+        gameState.phase3Enabled = toggle.checked;
+        status.textContent = gameState.phase3Enabled ? "Activée" : "Désactivée";
+        status.style.color = gameState.phase3Enabled ? "var(--color-primary)" : "var(--text-muted)";
+    }
+}
+
+function updateOnlinePhase3Text() {
+    const toggle = document.getElementById('online-phase3-toggle');
+    const status = document.getElementById('online-phase3-status-text');
+    if (toggle && status) {
+        gameState.phase3Enabled = toggle.checked;
+        status.textContent = gameState.phase3Enabled ? "Activée" : "Désactivée";
+        status.style.color = gameState.phase3Enabled ? "var(--color-primary)" : "var(--text-muted)";
+        
+        if (gameState.mode === 'ONLINE' && gameState.isHost) {
+            broadcastState();
+        }
+    }
+}
+
+function syncPseudoInput(val) {
+    localStorage.setItem('neologix_pseudo', val);
+    
+    const hostInput = document.getElementById('online-host-name');
+    const clientInput = document.getElementById('online-client-name');
+    const localInputs = document.querySelectorAll('.player-name-input');
+    
+    if (hostInput && hostInput.value !== val) hostInput.value = val;
+    if (clientInput && clientInput.value !== val) clientInput.value = val;
+    if (localInputs.length > 0 && localInputs[0].value !== val) localInputs[0].value = val;
+}
+
+function saveSession() {
+    if (gameState.mode === 'ONLINE') {
+        const sessionData = {
+            mode: gameState.mode,
+            role: onlineRole,
+            roomCode: document.getElementById('lobby-room-code').textContent,
+            myPlayerId: gameState.myPlayerId,
+            players: gameState.players,
+            gamePhase: gameState.gamePhase,
+            currentRound: gameState.currentRound,
+            currentPhase: gameState.currentPhase,
+            roundData: gameState.roundData,
+            propositions: gameState.propositions,
+            votes: gameState.votes,
+            voteOptions: gameState.voteOptions,
+            clientVoteOpts: gameState.clientVoteOpts,
+            winningWordsList: gameState.winningWordsList,
+            cadavreSentences: gameState.cadavreSentences,
+            cadavreVotes: gameState.cadavreVotes,
+            activeCadavreIndex: gameState.activeCadavreIndex,
+            roundCount: gameState.roundCount,
+            timerEnabled: gameState.timerEnabled,
+            phase3Enabled: gameState.phase3Enabled
+        };
+        sessionStorage.setItem('neologix_online_session', JSON.stringify(sessionData));
+    } else {
+        sessionStorage.removeItem('neologix_online_session');
+    }
+}
+
+function restoreOnlineSession(session) {
+    gameState.mode = session.mode;
+    onlineRole = session.role;
+    gameState.myPlayerId = session.myPlayerId;
+    gameState.players = session.players;
+    gameState.gamePhase = session.gamePhase;
+    gameState.currentRound = session.currentRound;
+    gameState.currentPhase = session.currentPhase;
+    gameState.roundData = session.roundData;
+    gameState.propositions = session.propositions || [];
+    gameState.votes = session.votes || [];
+    gameState.voteOptions = session.voteOptions || [];
+    gameState.clientVoteOpts = session.clientVoteOpts || [];
+    gameState.winningWordsList = session.winningWordsList || [];
+    gameState.cadavreSentences = session.cadavreSentences || [];
+    gameState.cadavreVotes = session.cadavreVotes || [];
+    gameState.activeCadavreIndex = session.activeCadavreIndex;
+    gameState.roundCount = session.roundCount;
+    gameState.timerEnabled = session.timerEnabled;
+    gameState.phase3Enabled = session.phase3Enabled;
+    
+    selectLobbyMode('ONLINE');
+    selectOnlineRole(session.role);
+    
+    if (session.role === 'HOST') {
+        gameState.isHost = true;
+        document.getElementById('online-lobby-status-msg').textContent = "Reconstitution du salon après déconnexion...";
+        
+        const hostId = session.roomCode.toLowerCase();
+        peer = new Peer(hostId);
+        
+        peer.on('open', (id) => {
+            setupHostLobbyUI(id);
+            if (gameState.gamePhase !== 'LOBBY') {
+                document.getElementById('global-header').classList.remove('hidden');
+                resumeHostGameScreen();
+            }
+        });
+        
+        peer.on('connection', (conn) => {
+            handleIncomingConnection(conn);
+        });
+        
+        peer.on('error', (err) => {
+            console.error("Erreur PeerJS lors de la restauration :", err);
+            cleanupNetwork();
+            sessionStorage.removeItem('neologix_online_session');
+            alert("Impossible de restaurer le salon hôte.");
+            selectLobbyMode('ONLINE');
+        });
+    } else {
+        gameState.isHost = false;
+        document.getElementById('online-lobby-status-msg').textContent = "Reconnexion en cours au salon...";
+        document.getElementById('online-client-setup').classList.add('hidden');
+        document.getElementById('online-lobby-room').classList.remove('hidden');
+        document.getElementById('lobby-room-code').textContent = session.roomCode;
+        
+        peer = new Peer();
+        
+        peer.on('open', () => {
+            attemptClientReconnection(session.roomCode.toLowerCase());
+        });
+    }
+}
+
+function resumeHostGameScreen() {
+    updateGlobalHeader();
+    if (gameState.gamePhase === 'INPUT') {
+        showScreen('saisie');
+        setupOnlineHostSaisieUI(timerSecondsRemaining || 90);
+    } else if (gameState.gamePhase === 'VOTE') {
+        showScreen('vote');
+        setupOnlineHostVoteUI();
+    } else if (gameState.gamePhase === 'CADAVRE') {
+        showScreen('cadavreExquis');
+        triggerNextOnlineCadavreTurn();
+    } else if (gameState.gamePhase === 'STORY_VOTE') {
+        showScreen('cadavreReveal');
+        const definitionsMap = {};
+        for (let r in gameState.roundData) {
+            definitionsMap[gameState.roundData[r].word.toUpperCase()] = gameState.roundData[r].definition;
+        }
+        renderOnlineStoryText(gameState.cadavreSentences, definitionsMap);
+        renderOnlineStoryVoteArea(getActivePlayers());
+        startStoryVoteTimer(30);
+    } else if (gameState.gamePhase === 'PODIUM') {
+        showScreen('podium');
+        showFinalPodium();
+    }
+}
+
+function resumeClientGameScreen(writerName) {
+    updateGlobalHeader();
+    if (gameState.gamePhase === 'INPUT') {
+        showScreen('saisie');
+        setupClientSaisieUI(timerSecondsRemaining || 90);
+    } else if (gameState.gamePhase === 'VOTE') {
+        showScreen('vote');
+        setupClientVoteUI();
+    } else if (gameState.gamePhase === 'CADAVRE') {
+        showScreen('cadavreExquis');
+        const activePlayers = getActivePlayers();
+        const currentPlayer = activePlayers[gameState.activeCadavreIndex];
+        const isMyTurn = currentPlayer && (currentPlayer.id === gameState.myPlayerId);
+        
+        if (isMyTurn) {
+            let peekText = "";
+            if (gameState.cadavreSentences.length > 0) {
+                const lastText = gameState.cadavreSentences[gameState.cadavreSentences.length - 1].text;
+                const peekLen = 25;
+                peekText = lastText.length > peekLen ? `... ${lastText.substring(lastText.length - peekLen)}` : lastText;
+            }
+            setupClientCadavreUI(peekText, timerSecondsRemaining || 90);
+        } else {
+            setupClientCadavreWaitUI(writerName);
+        }
+    } else if (gameState.gamePhase === 'STORY_VOTE') {
+        showScreen('cadavreReveal');
+        const definitionsMap = {};
+        for (let r in gameState.roundData) {
+            definitionsMap[gameState.roundData[r].word.toUpperCase()] = gameState.roundData[r].definition;
+        }
+        renderOnlineStoryText(gameState.cadavreSentences, definitionsMap);
+        renderOnlineStoryVoteArea(getActivePlayers());
+    } else if (gameState.gamePhase === 'PODIUM') {
+        showScreen('podium');
+        showFinalPodium();
+    }
+}
+
+function attemptClientReconnection(hostId) {
+    if (!peer || peer.destroyed) return;
+    
+    myConnection = peer.connect(hostId);
+    
+    myConnection.on('open', () => {
+        document.getElementById('online-lobby-status-msg').textContent = "Reconnecté, resynchronisation en cours...";
+        
+        const clientName = localStorage.getItem('neologix_pseudo') || "Joueur";
+        myConnection.send({
+            type: 'JOIN',
+            name: clientName
+        });
+    });
+    
+    myConnection.on('error', (err) => {
+        console.warn("Échec de tentative de reconnexion, nouvel essai dans 2s...", err);
+        setTimeout(() => attemptClientReconnection(hostId), 2000);
+    });
+    
+    myConnection.on('close', () => {
+        console.warn("Connexion perdue avec l'hôte, tentative de reconnexion dans 2s...");
+        document.getElementById('online-lobby-status-msg').textContent = "Connexion perdue, tentative de reconnexion...";
+        showScreen('lobby');
+        document.getElementById('online-client-setup').classList.add('hidden');
+        document.getElementById('online-lobby-room').classList.remove('hidden');
+        
+        setTimeout(() => attemptClientReconnection(hostId), 2000);
+    });
+    
+    myConnection.on('data', (data) => {
+        handleClientIncomingMessage(data);
+    });
 }

@@ -64,6 +64,17 @@
                         </div>
 
                         <div class="setup-group">
+                            <label>Phase 3 (Phrase d'exemple) :</label>
+                            <div class="toggle-container">
+                                <label class="switch">
+                                    <input type="checkbox" id="phase3-toggle" checked onchange="updatePhase3Text()">
+                                    <span class="slider round"></span>
+                                </label>
+                                <span id="phase3-status-text" style="color: var(--color-primary);">Activée</span>
+                            </div>
+                        </div>
+
+                        <div class="setup-group">
                             <label>Joueurs (2 à 4) :</label>
                             <div id="players-list-input">
                                 <div class="player-input-row">
@@ -116,6 +127,17 @@
                                         <span class="slider round"></span>
                                     </label>
                                     <span id="online-timer-status-text">Actif (30s / 90s)</span>
+                                </div>
+                            </div>
+
+                            <div class="setup-group">
+                                <label>Phase 3 (Phrase d'exemple) :</label>
+                                <div class="toggle-container">
+                                    <label class="switch">
+                                        <input type="checkbox" id="online-phase3-toggle" checked onchange="updateOnlinePhase3Text()">
+                                        <span class="slider round"></span>
+                                    </label>
+                                    <span id="online-phase3-status-text" style="color: var(--color-primary);">Activée</span>
                                 </div>
                             </div>
 
