@@ -2912,7 +2912,7 @@ function startConfetti(canvasId) {
     canvas.height = canvas.parentElement.offsetHeight;
     
     let particles = [];
-    const colors = ['#ff1f7b', '#00f0ff', '#ffd700', '#39ff14', '#ffffff'];
+    const colors = ['#ff4757', '#2e86de', '#ffa502', '#ffffff'];
     
     for (let i = 0; i < 120; i++) {
         particles.push({
