@@ -107,6 +107,20 @@ function selectOnlineRole(role) {
     document.getElementById('online-lobby-room').classList.add('hidden'); // masquer le salon actif
     
     cleanupNetwork();
+    
+    if (role === 'CLIENT') {
+        const codeInput = document.getElementById('online-game-code');
+        if (codeInput) {
+            if (codeInput.value === "" || codeInput.value === "NEO-") {
+                codeInput.value = "NEO-";
+            }
+            setTimeout(() => {
+                codeInput.focus();
+                const valLen = codeInput.value.length;
+                codeInput.setSelectionRange(valLen, valLen);
+            }, 100);
+        }
+    }
 }
 
 function adjustRounds(amount) {
