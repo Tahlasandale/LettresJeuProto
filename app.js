@@ -52,6 +52,7 @@ let peer = null;
 let connections = new Map(); // Map de { playerId: DataConnection } (Hôte seulement)
 let myConnection = null;     // Liaison avec l'hôte (Client seulement)
 let onlineRole = 'HOST';     // 'HOST' | 'CLIENT'
+let currentStoryVoterIdx = 0;
 
 // --- Variables Système ---
 let timerInterval = null;
@@ -297,7 +298,7 @@ function registerNewPlayer(conn, name) {
     }
     
     const newId = gameState.players.length;
-    conn.metadata = { playerId: newId }; // Rattacher l'ID à la connexion
+    conn.metadata = { playerId: newId, playerName: finalName }; // Rattacher l'ID à la connexion
     connections.set(newId, conn);
     
     gameState.players.push({
@@ -540,8 +541,8 @@ function handleClientIncomingMessage(data) {
             break;
             
         case 'STORY_VOTE_TICK':
-            // Rendre le vote pour le joueur actif en cours
-            updateOnlineStoryVoteStatus(data.currentVoterName, data.activePlayers);
+            currentStoryVoterIdx = data.currentVoterIdx;
+            updateOnlineStoryVoteStatus(data.currentVoterName, data.activePlayers, data.timeRemaining);
             break;
             
         case 'GAME_OVER':
@@ -568,15 +569,45 @@ function handlePlayerDisconnect(playerId) {
     p.active = false;
     connections.delete(playerId);
     
-    // Diffuser la déconnexion
-    sendToAll({
-        type: 'PLAYER_DISCONNECT',
-        name: p.name,
-        players: gameState.players
-    });
-    
-    // Si la partie a commencé
-    if (gameState.gamePhase !== 'LOBBY') {
+    // Si la partie est encore au salon (LOBBY), on retire complètement le joueur
+    if (gameState.gamePhase === 'LOBBY') {
+        // Re-mapper le tableau de joueurs restants (l'Hôte reste id 0)
+        const activeClients = Array.from(connections.values());
+        gameState.players = [{ id: 0, name: gameState.players[0].name, score: 0, active: true }];
+        
+        connections.clear();
+        activeClients.forEach((conn, index) => {
+            const newId = index + 1;
+            conn.metadata = { playerId: newId, playerName: conn.metadata.playerName };
+            connections.set(newId, conn);
+            gameState.players.push({
+                id: newId,
+                name: conn.metadata.playerName || `Joueur ${newId + 1}`,
+                score: 0,
+                active: true
+            });
+            // Envoyer la mise à jour de l'ID au client
+            conn.send({
+                type: 'WELCOME',
+                playerId: newId,
+                players: gameState.players,
+                code: peer.id.toUpperCase(),
+                roundCount: gameState.roundCount,
+                timerEnabled: gameState.timerEnabled
+            });
+        });
+        
+        broadcastState();
+        updateOnlinePlayersDisplay();
+    } else {
+        // En partie
+        // Diffuser la déconnexion
+        sendToAll({
+            type: 'PLAYER_DISCONNECT',
+            name: p.name,
+            players: gameState.players
+        });
+        
         if (!checkActivePlayersCount()) return;
         
         // Vérifier si cela débloque une attente
@@ -589,9 +620,67 @@ function handlePlayerDisconnect(playerId) {
         } else if (gameState.gamePhase === 'STORY_VOTE') {
             checkAllStoryVotesSubmitted();
         }
-    } else {
-        updateOnlinePlayersDisplay();
     }
+}
+
+function checkAllCadavreSubmitted() {
+    if (gameState.gamePhase !== 'CADAVRE') return;
+    const activePlayers = getActivePlayers();
+    if (gameState.activeCadavreIndex >= activePlayers.length) {
+        initOnlineCadavreReveal();
+    } else {
+        triggerNextOnlineCadavreTurn();
+    }
+}
+
+function checkAllStoryVotesSubmitted() {
+    if (gameState.gamePhase !== 'STORY_VOTE') return;
+    const activePlayers = getActivePlayers();
+    if (currentStoryVoterIdx >= activePlayers.length) {
+        tallyCadavreVotes();
+    } else {
+        sendToAll({
+            type: 'STORY_VOTE_TICK',
+            currentVoterIdx: currentStoryVoterIdx,
+            activePlayers: activePlayers
+        });
+        renderOnlineStoryVoteArea(activePlayers);
+    }
+}
+
+function renderScoreboard() {
+    const list = document.getElementById('scoreboard-list');
+    if (!list) return;
+    list.innerHTML = "";
+    
+    const sorted = [...gameState.players].sort((a, b) => {
+        if (!a.active && b.active) return 1;
+        if (a.active && !b.active) return -1;
+        return b.score - a.score;
+    });
+    
+    sorted.forEach((p, idx) => {
+        const row = document.createElement('div');
+        row.className = `score-row ${!p.active ? 'cursed' : ''}`;
+        row.innerHTML = `
+            <div class="score-player-name">
+                <span class="score-player-rank">${idx + 1}</span>
+                ${escapeHTML(p.name)}
+            </div>
+            <div class="score-player-val">${p.score} pts</div>
+        `;
+        list.appendChild(row);
+    });
+}
+
+function escapeHTML(str) {
+    if (!str) return "";
+    return str
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
 }
 
 
@@ -869,6 +958,23 @@ function submitClientSaisie() {
             alert("Lettres et tiret uniquement (min. 2).");
             return;
         }
+        // Vérification des lettres imposées du tirage côté client
+        const rackCopy = [...gameState.roundData[gameState.currentRound].letters];
+        const inputLetters = val.toUpperCase().split('');
+        let lettersMatch = true;
+        for (let char of inputLetters) {
+            const index = rackCopy.indexOf(char);
+            if (index === -1) {
+                lettersMatch = false;
+                break;
+            } else {
+                rackCopy.splice(index, 1);
+            }
+        }
+        if (!lettersMatch) {
+            alert(`Ton mot ne peut contenir que les lettres du tirage : ${gameState.roundData[gameState.currentRound].letters.join(', ')}`);
+            return;
+        }
     } else if (gameState.currentPhase === 3) {
         const officialWord = gameState.roundData[gameState.currentRound].word.toLowerCase();
         if (!val.toLowerCase().includes(officialWord)) {
@@ -890,8 +996,39 @@ function submitClientSaisie() {
 }
 
 function registerOnlineProposition(playerId, text) {
+    if (gameState.gamePhase !== 'INPUT') return;
     // Vérifier que le joueur n'a pas déjà soumis
     if (gameState.propositions.some(p => p.playerId === playerId)) return;
+    
+    // Valider la proposition du joueur contre les règles de la phase courante
+    let isValid = true;
+    if (gameState.currentPhase === 1) {
+        if (!/^[a-zA-ZáàâäéèêëíìîïóòôöúùûüçÇœŒæÆ-]+$/.test(text) || text.length < 2) {
+            isValid = false;
+        } else {
+            const rackCopy = [...gameState.roundData[gameState.currentRound].letters];
+            const inputLetters = text.toUpperCase().split('');
+            for (let char of inputLetters) {
+                const index = rackCopy.indexOf(char);
+                if (index === -1) {
+                    isValid = false;
+                    break;
+                } else {
+                    rackCopy.splice(index, 1);
+                }
+            }
+        }
+    } else if (gameState.currentPhase === 3) {
+        const officialWord = gameState.roundData[gameState.currentRound].word.toLowerCase();
+        if (!text.toLowerCase().includes(officialWord)) {
+            isValid = false;
+        }
+    }
+    
+    if (!isValid) {
+        console.warn(`Proposition invalide reçue du joueur ${playerId}: ${text}`);
+        return;
+    }
     
     gameState.propositions.push({
         playerId: playerId,
@@ -902,6 +1039,7 @@ function registerOnlineProposition(playerId, text) {
 }
 
 function checkAllInputsSubmitted() {
+    if (gameState.gamePhase !== 'INPUT') return;
     const activeCount = getActivePlayers().length;
     if (gameState.propositions.length >= activeCount) {
         clearInterval(timerInterval);
@@ -1118,49 +1256,49 @@ function startOnlineTimer(duration) {
 }
 
 function handleOnlineAFKTimeout() {
-    // Vérifier qui n'a pas soumis de proposition
-    const activePlayers = getActivePlayers();
-    const inputField = document.getElementById('saisie-input');
+    if (gameState.gamePhase !== 'INPUT') return;
     
     // Auto-saisie de l'Hôte si non vide
     if (!gameState.propositions.some(p => p.playerId === 0)) {
+        const inputField = document.getElementById('saisie-input');
         const val = inputField.value.trim();
         if (val !== "" && validateSaisieInputLocal(val)) {
             gameState.propositions.push({ playerId: 0, text: val });
         }
     }
     
-    // Traiter chaque joueur actif
-    activePlayers.forEach((player) => {
-        const hasSubmitted = gameState.propositions.some(p => p.playerId === player.id);
+    // Attendre 1.5s pour laisser le temps aux auto-soumissions réseau d'arriver
+    setTimeout(() => {
+        if (gameState.gamePhase !== 'INPUT') return;
         
-        if (!hasSubmitted) {
-            // Le joueur a-t-il une saisie non vide sur son écran ?
-            // L'Hôte ne peut pas lire l'écran des clients, mais au moment du timer=0
-            // on disqualifie les retardataires n'ayant pas reçu de proposition.
-            // (Note: La validation client a déjà été gérée au moment de l'expiration locale,
-            // si elle était non-vide, elle s'est auto-soumise à l'Hôte il y a 1s).
+        const activePlayers = getActivePlayers();
+        
+        // Traiter chaque joueur actif
+        activePlayers.forEach((player) => {
+            const hasSubmitted = gameState.propositions.some(p => p.playerId === player.id);
             
-            // Disqualifier le client
-            player.active = false;
-            if (player.id !== 0) {
-                const conn = connections.get(player.id);
-                if (conn) {
-                    conn.send({ type: 'KICK', reason: "Temps écoulé ou proposition invalide (AFK)." });
-                    conn.close();
+            if (!hasSubmitted) {
+                // Disqualifier le client
+                player.active = false;
+                if (player.id !== 0) {
+                    const conn = connections.get(player.id);
+                    if (conn) {
+                        conn.send({ type: 'KICK', reason: "Temps écoulé ou proposition invalide (AFK)." });
+                        conn.close();
+                    }
+                } else {
+                    alert("💀 Vous avez été éliminé pour inactivité !");
                 }
-            } else {
-                alert("💀 Vous avez été éliminé pour inactivité !");
             }
+        });
+        
+        // Mettre à jour l'état de jeu
+        broadcastState();
+        
+        if (checkActivePlayersCount()) {
+            initVotePhase();
         }
-    });
-    
-    // Mettre à jour l'état de jeu
-    broadcastState();
-    
-    if (checkActivePlayersCount()) {
-        initVotePhase();
-    }
+    }, 1500);
 }
 
 // --- Timers Clients (Fictif synchronisé) ---
@@ -1185,31 +1323,45 @@ function startClientTimer(duration) {
 }
 
 function syncClientTimer(seconds, total) {
-    const timerText = document.getElementById('timer-text');
-    const timerBar = document.getElementById('timer-bar');
-    const wrapper = document.querySelector('.timer-wrapper');
-    
-    if (!wrapper) return;
-    
-    timerSecondsRemaining = seconds;
-    timerText.textContent = seconds;
-    
-    const pct = seconds / total;
-    const offset = 283 * (1 - pct);
-    timerBar.style.strokeDashoffset = offset;
-    
-    if (seconds <= 10) {
-        wrapper.classList.add('timer-hurry');
+    if (gameState.gamePhase === 'CADAVRE') {
+        const timerText = document.getElementById('cadavre-timer-value');
+        if (timerText) {
+            timerText.textContent = seconds;
+        }
+        if (seconds <= 0) {
+            clearInterval(timerInterval);
+            const textarea = document.getElementById('cadavre-textarea');
+            if (!textarea.disabled && textarea.value.trim() !== "") {
+                submitClientCadavre();
+            }
+        }
     } else {
-        wrapper.classList.remove('timer-hurry');
-    }
-    
-    if (seconds <= 0) {
-        clearInterval(timerInterval);
-        // Si le champ est non vide, tenter de soumettre automatiquement avant l'exclusion
-        const inputField = document.getElementById('saisie-input');
-        if (!inputField.disabled && inputField.value.trim() !== "") {
-            submitClientSaisie();
+        const timerText = document.getElementById('timer-text');
+        const timerBar = document.getElementById('timer-bar');
+        const wrapper = document.querySelector('.timer-wrapper');
+        
+        if (!wrapper) return;
+        
+        timerSecondsRemaining = seconds;
+        timerText.textContent = seconds;
+        
+        const pct = seconds / total;
+        const offset = 283 * (1 - pct);
+        timerBar.style.strokeDashoffset = offset;
+        
+        if (seconds <= 10) {
+            wrapper.classList.add('timer-hurry');
+        } else {
+            wrapper.classList.remove('timer-hurry');
+        }
+        
+        if (seconds <= 0) {
+            clearInterval(timerInterval);
+            // Si le champ est non vide, tenter de soumettre automatiquement avant l'exclusion
+            const inputField = document.getElementById('saisie-input');
+            if (!inputField.disabled && inputField.value.trim() !== "") {
+                submitClientSaisie();
+            }
         }
     }
 }
@@ -1351,6 +1503,15 @@ function initVotePhase() {
                 setupOnlineHostVoteUI();
             }
         });
+        
+        // Si l'Hôte est inactif, il doit voir un écran de spectateur pour ne pas figer son affichage
+        if (!gameState.players[0].active) {
+            showScreen('vote');
+            document.getElementById('vote-prompt-title').textContent = "Mode Spectateur";
+            document.getElementById('vote-voter-name').textContent = "Tu as été éliminé de la partie";
+            document.getElementById('vote-cards-area').innerHTML = "<div class='info-text'>Les autres joueurs sont en train de voter...</div>";
+            document.getElementById('btn-submit-vote').disabled = true;
+        }
     }
 }
 
@@ -1370,6 +1531,17 @@ function setupOnlineHostVoteUI() {
     const voterName = document.getElementById('vote-voter-name');
     const container = document.getElementById('vote-cards-area');
     const voteTitle = document.getElementById('vote-prompt-title');
+    
+    // Mettre à jour dynamiquement la notice d'aide
+    const activePlayers = getActivePlayers();
+    const infoText = document.querySelector('.vote-actions .info-text');
+    if (infoText) {
+        if (activePlayers.length > 2) {
+            infoText.textContent = "Clique sur une carte pour la sélectionner. Tu ne peux pas voter pour ta propre proposition (elle est grisée).";
+        } else {
+            infoText.textContent = "Clique sur une carte pour la sélectionner. Exception : à 2 joueurs, vous pouvez voter pour votre propre proposition !";
+        }
+    }
     
     voterName.textContent = `Votant : Hôte`;
     container.innerHTML = "";
@@ -1426,6 +1598,17 @@ function setupClientVoteUI() {
     const container = document.getElementById('vote-cards-area');
     const voteTitle = document.getElementById('vote-prompt-title');
     
+    // Mettre à jour dynamiquement la notice d'aide
+    const activePlayers = getActivePlayers();
+    const infoText = document.querySelector('.vote-actions .info-text');
+    if (infoText) {
+        if (activePlayers.length > 2) {
+            infoText.textContent = "Clique sur une carte pour la sélectionner. Tu ne peux pas voter pour ta propre proposition (elle est grisée).";
+        } else {
+            infoText.textContent = "Clique sur une carte pour la sélectionner. Exception : à 2 joueurs, vous pouvez voter pour votre propre proposition !";
+        }
+    }
+    
     voterName.textContent = `Votant : Toi`;
     container.innerHTML = "";
     
@@ -1436,7 +1619,7 @@ function setupClientVoteUI() {
     }
     
     gameState.voteOptions.forEach((opt) => {
-        card = document.createElement('div');
+        const card = document.createElement('div');
         card.className = `vote-card ${opt.isOwn ? 'disabled' : ''}`;
         card.dataset.playerId = opt.playerId;
         
@@ -1513,6 +1696,16 @@ function setupLocalVoteUI() {
     const activePlayers = getActivePlayers();
     const currentVoter = activePlayers[gameState.activeVoterIndex];
     
+    // Mettre à jour dynamiquement la notice d'aide
+    const infoText = document.querySelector('.vote-actions .info-text');
+    if (infoText) {
+        if (activePlayers.length > 2) {
+            infoText.textContent = "Clique sur une carte pour la sélectionner. Tu ne peux pas voter pour ta propre proposition (elle est grisée).";
+        } else {
+            infoText.textContent = "Clique sur une carte pour la sélectionner. Exception : à 2 joueurs, vous pouvez voter pour votre propre proposition !";
+        }
+    }
+    
     document.getElementById('vote-voter-name').textContent = `Votant : ${currentVoter.name}`;
     const container = document.getElementById('vote-cards-area');
     container.innerHTML = "";
@@ -1545,11 +1738,15 @@ function setupLocalVoteUI() {
     
     document.getElementById('btn-submit-vote').disabled = true;
     document.getElementById('btn-submit-vote').onclick = submitLocalVote;
+    
+    // Démarrer le timer de 30 secondes pour le vote local
+    startTimer(30);
 }
 
 function submitLocalVote() {
     if (selectedVotePlayerId === null) return;
     
+    clearInterval(timerInterval);
     const activePlayers = getActivePlayers();
     const currentVoter = activePlayers[gameState.activeVoterIndex];
     
@@ -1566,6 +1763,7 @@ function submitLocalVote() {
 // --- Dépouillement des votes ---
 
 function tallyVotes() {
+    clearInterval(timerInterval);
     const voteCounts = {};
     const optionsToCount = gameState.isMortSubite ? gameState.mortSubiteTies : gameState.propositions.map(p => p.playerId);
     
@@ -1766,6 +1964,16 @@ function triggerNextOnlineCadavreTurn() {
             }
         }
     });
+    
+    // Si l'hôte est inactif, on doit lui configurer son écran en mode veille
+    const isHostActive = gameState.players[0].active;
+    if (!isHostActive) {
+        showScreen('cadavreExquis');
+        setupClientCadavreWaitUI(currentPlayer.name);
+    }
+    
+    // Lancer le timer autoritaire pour ce tour de cadavre
+    startCadavreTimer(90);
 }
 
 function setupOnlineHostCadavreUI(peekText, duration) {
@@ -2131,8 +2339,8 @@ function handleCadavreAFK() {
         // En ligne (Hôte gère l'AFK du rédacteur actif)
         const currentPlayer = activePlayers[gameState.activeCadavreIndex];
         
-        // Si Hôte et non-vide, auto-validation locale
-        if (gameState.activeCadavreIndex === 0) {
+        if (currentPlayer.id === 0) {
+            // Si Hôte et non-vide, auto-validation locale
             const textarea = document.getElementById('cadavre-textarea');
             const val = textarea.value.trim();
             let usedWord = "";
@@ -2148,28 +2356,49 @@ function handleCadavreAFK() {
                 triggerNextOnlineCadavreTurn();
                 return;
             }
-        }
-        
-        // Exclure le joueur
-        currentPlayer.active = false;
-        if (currentPlayer.id !== 0) {
-            const conn = connections.get(currentPlayer.id);
-            if (conn) {
-                conn.send({ type: 'KICK', reason: "Temps écoulé au cadavre exquis." });
-                conn.close();
+            
+            // Sinon, disqualifier l'hôte
+            currentPlayer.active = false;
+            alert("💀 Vous avez été éliminé pour inactivité au Cadavre Exquis !");
+            broadcastState();
+            
+            const newActive = getActivePlayers();
+            if (gameState.activeCadavreIndex >= newActive.length) {
+                gameState.activeCadavreIndex = newActive.length;
+            }
+            if (checkActivePlayersCount()) {
+                triggerNextOnlineCadavreTurn();
             }
         } else {
-            alert("Disqualifié pour inactivité.");
-        }
-        
-        broadcastState();
-        
-        const newActive = getActivePlayers();
-        if (gameState.activeCadavreIndex >= newActive.length) {
-            gameState.activeCadavreIndex = newActive.length;
-        }
-        if (checkActivePlayersCount()) {
-            triggerNextOnlineCadavreTurn();
+            // Rédacteur = Client. On attend 1.5s pour laisser arriver une éventuelle auto-soumission
+            setTimeout(() => {
+                // Vérifier si le joueur s'est soumis ou déconnecté entre temps
+                const hasSubmitted = gameState.cadavreSentences.some(s => s.playerId === currentPlayer.id);
+                if (hasSubmitted || !currentPlayer.active) return;
+                
+                // Toujours pas soumis -> KICK
+                currentPlayer.active = false;
+                const conn = connections.get(currentPlayer.id);
+                if (conn) {
+                    conn.send({ type: 'KICK', reason: "Temps écoulé au cadavre exquis." });
+                    conn.close();
+                }
+                
+                // Diffuser la déconnexion
+                sendToAll({
+                    type: 'PLAYER_DISCONNECT',
+                    name: currentPlayer.name,
+                    players: gameState.players
+                });
+                
+                const newActive = getActivePlayers();
+                if (gameState.activeCadavreIndex >= newActive.length) {
+                    gameState.activeCadavreIndex = newActive.length;
+                }
+                if (checkActivePlayersCount()) {
+                    triggerNextOnlineCadavreTurn();
+                }
+            }, 1500);
         }
     }
 }
@@ -2194,11 +2423,11 @@ function initLocalCadavreReveal() {
     storyDiv.innerHTML = "";
     let fullStoryHtml = "";
     gameState.cadavreSentences.forEach((sentence, idx) => {
-        let sentenceText = sentence.text;
+        let sentenceText = escapeHTML(sentence.text);
         if (sentence.usedWord) {
             const wordUpper = sentence.usedWord.toUpperCase();
-            const defText = definitionsMap[wordUpper] || "";
-            const regex = new RegExp(`(${sentence.usedWord})`, 'gi');
+            const defText = escapeHTML(definitionsMap[wordUpper] || "");
+            const regex = new RegExp(`(${escapeHTML(sentence.usedWord)})`, 'gi');
             sentenceText = sentenceText.replace(regex, `<span class="story-word-highlight" data-tooltip="${wordUpper} : ${defText}">$1</span>`);
         }
         fullStoryHtml += `<span class="story-paragraph" style="animation-delay: ${idx * 0.5}s">${sentenceText} </span>`;
@@ -2221,20 +2450,25 @@ function renderLocalStoryVoteButtons() {
         return;
     }
     
+    // Démarrer le timer de 30 secondes pour le vote de la plume d'or local
+    startStoryVoteTimer(30);
+    
     const currentVoter = activePlayers[currentStoryVoterIdx];
     statusText.textContent = `Au tour de ${currentVoter.name} de voter...`;
     
     activePlayers.forEach(player => {
-        const isSelf = (player.id === currentVoter.id);
+        // Exception 2 joueurs
+        const isSelf = activePlayers.length > 2 ? (player.id === currentVoter.id) : false;
         
         const btn = document.createElement('button');
         btn.type = "button";
         btn.className = `btn-story-vote ${isSelf ? 'disabled' : ''}`;
-        btn.innerHTML = `Voter pour <strong>${player.name}</strong> <span>👍</span>`;
+        btn.innerHTML = `Voter pour <strong>${escapeHTML(player.name)}</strong> <span>👍</span>`;
         btn.disabled = isSelf;
         
         if (!isSelf) {
             btn.onclick = () => {
+                clearInterval(storyVoteTimerInterval);
                 gameState.cadavreVotes.push({
                     voterId: currentVoter.id,
                     targetId: player.id
@@ -2275,6 +2509,9 @@ function initOnlineCadavreReveal() {
     showScreen('cadavreReveal');
     renderOnlineStoryText(gameState.cadavreSentences, definitionsMap);
     renderOnlineStoryVoteArea(activePlayers);
+    
+    // Démarrer le timer de la plume d'or pour l'Hôte
+    startStoryVoteTimer(30);
 }
 
 function renderOnlineStoryText(sentences, definitionsMap) {
@@ -2283,11 +2520,11 @@ function renderOnlineStoryText(sentences, definitionsMap) {
     
     let fullStoryHtml = "";
     sentences.forEach((sentence, idx) => {
-        let sentenceText = sentence.text;
+        let sentenceText = escapeHTML(sentence.text);
         if (sentence.usedWord) {
             const wordUpper = sentence.usedWord.toUpperCase();
-            const defText = definitionsMap[wordUpper] || "";
-            const regex = new RegExp(`(${sentence.usedWord})`, 'gi');
+            const defText = escapeHTML(definitionsMap[wordUpper] || "");
+            const regex = new RegExp(`(${escapeHTML(sentence.usedWord)})`, 'gi');
             sentenceText = sentenceText.replace(regex, `<span class="story-word-highlight" data-tooltip="${wordUpper} : ${defText}">$1</span>`);
         }
         fullStoryHtml += `<span class="story-paragraph" style="animation-delay: ${idx * 0.4}s">${sentenceText} </span>`;
@@ -2306,16 +2543,15 @@ function renderOnlineStoryVoteArea(activePlayers) {
     statusText.textContent = `Au tour de ${currentVoter.name} de voter...`;
     
     activePlayers.forEach(player => {
-        const isSelf = (player.id === gameState.myPlayerId);
-        const isVoterSelf = (player.id === currentVoter.id);
+        // Exception 2 joueurs
+        const isVoterSelf = activePlayers.length > 2 ? (player.id === currentVoter.id) : false;
         
         const btn = document.createElement('button');
         btn.type = "button";
-        // Si c'est à moi de voter et que ce n'est pas moi-même
         const canClick = isMyTurn && !isVoterSelf;
         
         btn.className = `btn-story-vote ${(!canClick) ? 'disabled' : ''}`;
-        btn.innerHTML = `Voter pour <strong>${player.name}</strong> <span>👍</span>`;
+        btn.innerHTML = `Voter pour <strong>${escapeHTML(player.name)}</strong> <span>👍</span>`;
         btn.disabled = !canClick;
         
         if (canClick) {
@@ -2338,6 +2574,7 @@ function renderOnlineStoryVoteArea(activePlayers) {
 }
 
 function registerOnlineStoryVote(voterId, targetId) {
+    clearInterval(storyVoteTimerInterval);
     if (gameState.cadavreVotes.some(v => v.voterId === voterId)) return;
     
     gameState.cadavreVotes.push({
@@ -2356,20 +2593,111 @@ function registerOnlineStoryVote(voterId, targetId) {
         sendToAll({
             type: 'STORY_VOTE_TICK',
             currentVoterName: activePlayers[currentStoryVoterIdx].name,
-            activePlayers: activePlayers
+            activePlayers: activePlayers,
+            currentVoterIdx: currentStoryVoterIdx
         });
         
         // Mettre à jour l'hôte
         renderOnlineStoryVoteArea(activePlayers);
+        
+        // Relancer le timer pour le votant suivant
+        startStoryVoteTimer(30);
     }
 }
 
-function updateOnlineStoryVoteStatus(voterName, activePlayers) {
+function updateOnlineStoryVoteStatus(voterName, activePlayers, timeRemaining) {
     renderOnlineStoryVoteArea(activePlayers);
+    const statusText = document.getElementById('story-vote-status-text');
+    if (statusText && timeRemaining !== undefined) {
+        statusText.innerHTML = `Au tour de ${escapeHTML(voterName)} de voter... (⏳ ${timeRemaining}s)`;
+    }
 }
 
 function registerOnlineStoryVoteClient(voterId, targetId) {
     // Les clients reçoivent la mise à jour via STORY_VOTE_TICK
+}
+
+let storyVoteTimerInterval = null;
+function startStoryVoteTimer(duration) {
+    clearInterval(storyVoteTimerInterval);
+    if (!gameState.timerEnabled) return;
+    
+    let timeRemaining = duration;
+    const statusText = document.getElementById('story-vote-status-text');
+    const activePlayers = getActivePlayers();
+    const currentVoter = activePlayers[currentStoryVoterIdx];
+    if (!currentVoter) return;
+    
+    statusText.innerHTML = `Au tour de ${escapeHTML(currentVoter.name)} de voter... (⏳ ${timeRemaining}s)`;
+    
+    // Synchro initiale
+    if (gameState.mode === 'ONLINE' && gameState.isHost) {
+        sendToAll({
+            type: 'STORY_VOTE_TICK',
+            currentVoterName: currentVoter.name,
+            activePlayers: activePlayers,
+            currentVoterIdx: currentStoryVoterIdx,
+            timeRemaining: timeRemaining
+        });
+    }
+    
+    storyVoteTimerInterval = setInterval(() => {
+        timeRemaining--;
+        const currPlayers = getActivePlayers();
+        const currVoter = currPlayers[currentStoryVoterIdx];
+        if (!currVoter) {
+            clearInterval(storyVoteTimerInterval);
+            return;
+        }
+        
+        statusText.innerHTML = `Au tour de ${escapeHTML(currVoter.name)} de voter... (⏳ ${timeRemaining}s)`;
+        
+        // Synchro réseau
+        if (gameState.mode === 'ONLINE' && gameState.isHost) {
+            sendToAll({
+                type: 'STORY_VOTE_TICK',
+                currentVoterName: currVoter.name,
+                activePlayers: currPlayers,
+                currentVoterIdx: currentStoryVoterIdx,
+                timeRemaining: timeRemaining
+            });
+        }
+        
+        if (timeRemaining <= 0) {
+            clearInterval(storyVoteTimerInterval);
+            handleStoryVoteAFK();
+        }
+    }, 1000);
+}
+
+function handleStoryVoteAFK() {
+    const activePlayers = getActivePlayers();
+    const currentVoter = activePlayers[currentStoryVoterIdx];
+    if (!currentVoter) return;
+    
+    currentVoter.active = false;
+    alert(`💀 EXCLU ! ${currentVoter.name} a mis trop de temps à voter.`);
+    
+    if (gameState.mode === 'ONLINE') {
+        if (gameState.isHost) {
+            if (currentVoter.id !== 0) {
+                const conn = connections.get(currentVoter.id);
+                if (conn) {
+                    conn.send({ type: 'KICK', reason: "Temps écoulé pour le vote de la Plume d'Or." });
+                    conn.close();
+                }
+            }
+            broadcastState();
+            registerOnlineStoryVote(currentVoter.id, -1); // Vote blanc
+        }
+    } else {
+        if (currentStoryVoterIdx >= getActivePlayers().length) {
+            currentStoryVoterIdx = getActivePlayers().length;
+        }
+        if (checkActivePlayersCount()) {
+            renderLocalStoryVoteButtons();
+        }
+    }
 }
 
 function tallyCadavreVotes() {
@@ -2482,14 +2810,17 @@ function resetGame() {
     }
     
     clearInterval(timerInterval);
+    if (storyVoteTimerInterval) {
+        clearInterval(storyVoteTimerInterval);
+    }
     cleanupNetwork();
     
     document.getElementById('global-header').classList.add('hidden');
     currentStoryVoterIdx = 0;
     
-    // Reset views
-    document.getElementById('online-host-setup').classList.remove('hidden');
-    document.getElementById('online-client-setup').classList.add('hidden');
+    // Reset views (garder le panneau correspondant à onlineRole)
+    document.getElementById('online-host-setup').classList.toggle('hidden', onlineRole !== 'HOST');
+    document.getElementById('online-client-setup').classList.toggle('hidden', onlineRole !== 'CLIENT');
     document.getElementById('online-lobby-room').classList.add('hidden');
     
     // Restaurer champs inputs
@@ -2554,6 +2885,9 @@ function selectVoteCard(card) {
     selectedVotePlayerId = parseInt(card.dataset.playerId);
     document.getElementById('btn-submit-vote').disabled = false;
 }
+
+// Corriger le fait que renderScoreboard n'était pas défini
+// (utilisé au reveal_winner et au disconnect)
 
 function generateLetters() {
     let letters = [];
@@ -2628,4 +2962,47 @@ function startConfetti(canvasId) {
         cancelAnimationFrame(animationFrameId);
         ctx.clearRect(0, 0, canvas.width, canvas.height);
     };
+}
+
+// --- Stubs de fonctions pour les clics HTML inline (correction B1) ---
+
+function submitSaisie() {
+    if (gameState.mode === 'LOCAL') {
+        submitLocalSaisie();
+    } else if (gameState.isHost) {
+        submitOnlineHostSaisie();
+    } else {
+        submitClientSaisie();
+    }
+}
+
+function submitVote() {
+    if (gameState.mode === 'LOCAL') {
+        submitLocalVote();
+    } else if (gameState.isHost) {
+        submitOnlineHostVote();
+    } else {
+        submitClientVote();
+    }
+}
+
+function submitCadavreSentence() {
+    if (gameState.mode === 'LOCAL') {
+        submitLocalCadavre();
+    } else if (gameState.isHost) {
+        submitOnlineHostCadavre();
+    } else {
+        submitClientCadavre();
+    }
+}
+
+// --- Gestion des touches du clavier pour l'Input (correction M2) ---
+
+function handleSaisieKeydown(event) {
+    if (event.key === 'Enter') {
+        const btn = document.getElementById('btn-submit-saisie');
+        if (btn && !btn.disabled) {
+            btn.click();
+        }
+    }
 }
